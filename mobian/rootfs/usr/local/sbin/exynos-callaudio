@@ -24,6 +24,7 @@ stop)
 	killall -q aplay arecord; sleep 0.3
 	echo stop > $D
 	amixer -q -c0 cset name='SPK Digital PCM Volume' 769
+	amixer -q -c0 cset name='RCV Digital PCM Volume' 761	# gsm2sipd mutes it for a gateway call
 	amixer -q -c0 cset name='RCV Analog PCM Volume' 17
 	pw start
 	log "$(head -1 $D)" ;;

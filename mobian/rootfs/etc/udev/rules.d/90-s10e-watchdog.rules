@@ -1,0 +1,2 @@
+# The SoC watchdog (WDT_CLUSTER0) under a fixed name: softdog races it for watchdog0 at boot.
+SUBSYSTEM=="watchdog", KERNEL=="watchdog[0-9]*", DEVPATH=="*/10050000.watchdog/*", SYMLINK+="watchdog-s10e"

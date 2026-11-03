@@ -1,0 +1,155 @@
+From: pulpoff <pashkovsky@gmail.com>
+Subject: The AOD fades in and out over half a second (de.yesman.neo aod)
+
+Going off, the AOD fades in over the screen (the status bar the other way, since it can sit over the AOD
+while locked); coming back on, it fades out over the lock screen, which takes touches from the start of
+the fade. A blank or unblank in the middle of a fade turns it around from where it got to. Without
+animations (enable-animations off) it switches at once, as before.
+---
+--- a/src/shell.c
++++ b/src/shell.c
+@@ -14,6 +14,7 @@
+ 
+ #define G_LOG_DOMAIN "phosh-shell"
+ 
++#include <float.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -23,6 +24,7 @@
+ #include <glib/gi18n.h>
+ #include <gtk/gtk.h>
+ #include <gdk/gdkwayland.h>
++#include <handy.h>
+ 
+ #include "phosh-config.h"
+ #include "ambient.h"
+@@ -44,6 +46,7 @@
+ #include "docked-manager.h"
+ #include "emergency-calls-manager.h"
+ #include "aod.h"
++#include "animation.h"
+ #include "fader.h"
+ #include "feedbackinfo.h"
+ #include "feedback-manager.h"
+@@ -151,6 +154,8 @@ typedef struct {
+   gboolean                    overview_visible;
+   GPtrArray                  *faders; /* for final fade out */
+   PhoshAod                   *aod;    /* Neo: the always-on display while blanked */
++  PhoshAnimation             *aod_fade; /* Neo: the AOD fading in, or out on its way away */
++  gboolean                    aod_leaving;
+   GSettings                  *neo_settings;
+   GStrv log_domains;
+ 
+@@ -398,6 +403,72 @@ neo_aod_over_lockscreen (PhoshShell *sel
+ }
+ 
+ 
++#define NEO_AOD_FADE_MS 500
++
++/* the status bar fades the other way: it can sit over the AOD (both overlays while locked) */
++static void
++neo_aod_fade_value_cb (double value, PhoshShell *self)
++{
++  PhoshShellPrivate *priv = phosh_shell_get_instance_private (self);
++
++  if (priv->aod)
++    phosh_layer_surface_set_alpha (PHOSH_LAYER_SURFACE (priv->aod), value);
++  if (priv->top_panel)
++    phosh_layer_surface_set_alpha (PHOSH_LAYER_SURFACE (priv->top_panel), 1.0 - value);
++}
++
++
++static void
++neo_aod_fade_done_cb (PhoshShell *self)
++{
++  PhoshShellPrivate *priv = phosh_shell_get_instance_private (self);
++
++  g_clear_pointer (&priv->aod_fade, phosh_animation_unref);
++  if (priv->aod_leaving) {
++    priv->aod_leaving = FALSE;
++    g_clear_pointer (&priv->aod, phosh_cp_widget_destroy);
++  }
++}
++
++
++/*
++ * Neo: the AOD fades in over the screen as it goes off, and out over the lock screen as it comes back on,
++ * from wherever a fade the other way got to. While it fades out, touches already go to what is under it.
++ */
++static void
++neo_aod_fade (PhoshShell *self, gboolean in)
++{
++  PhoshShellPrivate *priv = phosh_shell_get_instance_private (self);
++  double from = in ? 0.0 : 1.0, to = in ? 1.0 : 0.0;
++  cairo_region_t *no_input = NULL;
++
++  if (priv->aod_fade) {
++    from = phosh_animation_get_value (priv->aod_fade);
++    g_clear_pointer (&priv->aod_fade, phosh_animation_unref);
++  }
++  priv->aod_leaving = !in;
++
++  if (!in)
++    no_input = cairo_region_create ();
++  gtk_widget_input_shape_combine_region (GTK_WIDGET (priv->aod), no_input);
++  g_clear_pointer (&no_input, cairo_region_destroy);
++
++  if (!hdy_get_enable_animations (GTK_WIDGET (priv->aod)) || G_APPROX_VALUE (from, to, DBL_EPSILON)) {
++    neo_aod_fade_value_cb (to, self);
++    neo_aod_fade_done_cb (self);
++    return;
++  }
++
++  priv->aod_fade = phosh_animation_new (GTK_WIDGET (priv->aod), from, to,
++                                        NEO_AOD_FADE_MS * ABS (to - from) * PHOSH_ANIMATION_SLOWDOWN,
++                                        PHOSH_ANIMATION_TYPE_EASE_OUT_CUBIC,
++                                        (PhoshAnimationValueCallback) neo_aod_fade_value_cb,
++                                        (PhoshAnimationDoneCallback) neo_aod_fade_done_cb,
++                                        self);
++  phosh_animation_start (priv->aod_fade);
++}
++
++
+ static void
+ neo_blanked_changed (PhoshShell *self, PhoshMonitor *monitor, gboolean blanked)
+ {
+@@ -407,8 +478,12 @@ neo_blanked_changed (PhoshShell *self, P
+   if (blanked && monitor->aod) {
+     if (!priv->aod) {
+       priv->aod = phosh_aod_new (monitor);
++      phosh_layer_surface_set_alpha (PHOSH_LAYER_SURFACE (priv->aod), 0.0);
+       gtk_widget_show (GTK_WIDGET (priv->aod));
+       neo_aod_over_lockscreen (self);
++      neo_aod_fade (self, TRUE);
++    } else if (priv->aod_leaving) {
++      neo_aod_fade (self, TRUE);
+     }
+   } else {
+     PhoshLockscreen *lockscreen = phosh_lockscreen_manager_get_lockscreen (priv->lockscreen_manager);
+@@ -416,11 +491,13 @@ neo_blanked_changed (PhoshShell *self, P
+     /* waking up: the lock screen hidden on the way in shows before the AOD goes */
+     if (lockscreen)
+       phosh_lockscreen_set_hidden (lockscreen, FALSE);
+-    g_clear_pointer (&priv->aod, phosh_cp_widget_destroy);
++    if (priv->aod && !priv->aod_leaving)
++      neo_aod_fade (self, FALSE);
+   }
+-  /* no status bar over the AOD: faded out rather than hidden, so its exclusive zone stays and nothing re-lays out */
+-  if (priv->top_panel)
+-    phosh_layer_surface_set_alpha (PHOSH_LAYER_SURFACE (priv->top_panel), priv->aod ? 0.0 : 1.0);
++  /* no status bar over the AOD: faded out rather than hidden, so its exclusive zone stays and nothing re-lays
++   * out (neo_aod_fade_value_cb fades it) */
++  if (!priv->aod && priv->top_panel)
++    phosh_layer_surface_set_alpha (PHOSH_LAYER_SURFACE (priv->top_panel), 1.0);
+ 
+   if (!priv->neo_settings) {
+     g_autoptr (GSettingsSchema) schema = NULL;
+@@ -546,6 +623,7 @@ panels_dispose (PhoshShell *self)
+ {
+   PhoshShellPrivate *priv = phosh_shell_get_instance_private (self);
+ 
++  g_clear_pointer (&priv->aod_fade, phosh_animation_unref);
+   g_clear_pointer (&priv->aod, phosh_cp_widget_destroy);
+   g_clear_object (&priv->neo_settings);
+   g_clear_pointer (&priv->top_panel, phosh_cp_widget_destroy);

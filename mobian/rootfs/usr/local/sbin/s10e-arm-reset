@@ -1,0 +1,10 @@
+#!/usr/bin/python3 -I
+# s10e-arm-reset: point S-Boot at RECOVERY (= U-Boot -> Mobian) for the next reset that the kernel does not
+# announce (watchdog, panic). PMU INFORM3 0x1586080c = 0x12345674 (recovery), SYSIP_DAT0 0x15860810 = 0xff.
+# A normal reboot or power-off still writes its own value through syscon-reboot-mode.
+import mmap, os, struct
+fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+m = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=0x15860000)
+for off, val in ((0x80c, 0x12345674), (0x810, 0xff)):
+    m[off:off + 4] = struct.pack("<I", val)
+    print("0x%08x = 0x%08x" % (0x15860000 + off, struct.unpack("<I", m[off:off + 4])[0]))

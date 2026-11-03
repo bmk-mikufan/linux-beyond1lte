@@ -1,0 +1,12 @@
+[Unit]
+Description=Sleep when the screen is off (Galaxy S10e)
+Documentation=file:///usr/local/share/doc/s10e-sleep/README.md
+After=dbus.service systemd-logind.service
+
+[Service]
+ExecStart=/usr/local/sbin/s10e-sleepd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

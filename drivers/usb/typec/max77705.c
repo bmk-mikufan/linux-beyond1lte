@@ -49,6 +49,7 @@
 #define MAX77705_CC_INT			0x03
 #define MAX77705_PD_INT			0x04
 #define MAX77705_USBC_STATUS2		0x07
+#define MAX77705_BC_STATUS		0x08
 #define MAX77705_UIC_FW_MINOR		0x09
 #define MAX77705_CC_STATUS0		0x0a
 #define MAX77705_PD_STATUS0		0x0c
@@ -87,6 +88,28 @@
 #define MAX77705_CCISTAT		GENMASK(5, 4)
 #define MAX77705_CCVCNSTAT		BIT(3)
 #define MAX77705_CCSTAT			GENMASK(2, 0)
+
+/* BC_STATUS, max77705.h:144-150: the chip's charger detection (BC1.2) */
+#define MAX77705_BC_PRCHGTYP		GENMASK(5, 3)
+#define MAX77705_BC_CHGTYP		GENMASK(1, 0)
+
+/* ChgTyp and PrChgTyp, max77705.h:297-312 */
+enum max77705_chgtyp {
+	MAX77705_CHGTYP_NONE = 0,
+	MAX77705_CHGTYP_SDP,
+	MAX77705_CHGTYP_CDP,
+	MAX77705_CHGTYP_DCP,
+};
+
+enum max77705_prchgtyp {
+	MAX77705_PRCHG_UNKNOWN = 0,
+	MAX77705_PRCHG_SAMSUNG_2A,
+	MAX77705_PRCHG_APPLE_0_5A,
+	MAX77705_PRCHG_APPLE_1A,
+	MAX77705_PRCHG_APPLE_2A,
+	MAX77705_PRCHG_APPLE_12W,
+	MAX77705_PRCHG_DCP_3A,
+};
 
 /* PD_STATUS1, max77705.h:178-181 */
 #define MAX77705_PD_DATAROLE_DFP	BIT(7)
@@ -214,6 +237,13 @@ enum max77705_ccistat {
 #define MAX77705_PD_MW_SLACK		100
 
 #define MAX77705_ILIM_SAFE_UA		500000
+/*
+ * Sinking without a PD contract, stock's cable-info (battery_data_beyond0lte
+ * _common.dtsi): a USB port 500 mA, a charging port (CDP) 1.5 A, a dedicated
+ * charger (TA) the default 1.8 A. Type-C current counts the same, capped there.
+ */
+#define MAX77705_ILIM_CDP_UA		1500000
+#define MAX77705_ILIM_NOPD_MAX_UA	1800000
 #define MAX77705_PD_MAX_REQUESTS	3
 #define MAX77705_PD_RETRY_MS		500
 #define MAX77705_PD_BACKOFF_MS		60000
@@ -310,6 +340,7 @@ struct max77705_usbc {
 	unsigned long pd_backoff_until;
 
 	int ilim_base_ua;
+	int nopd_ilim_ua;	/* set without a PD contract, 0 = not yet */
 	int voltage_uv;
 	int current_ua;
 
@@ -749,6 +780,81 @@ static enum typec_pwr_opmode max77705_usbc_opmode(u8 cc_status0)
 	}
 }
 
+/* What the chip's charger detection allows, 0 = nothing beyond USB. */
+static int max77705_bc_ilim_ua(unsigned int bc_status, const char **why)
+{
+	switch (FIELD_GET(MAX77705_BC_PRCHGTYP, bc_status)) {
+	case MAX77705_PRCHG_APPLE_0_5A:
+		return 0;
+	case MAX77705_PRCHG_APPLE_1A:
+		*why = "1 A charger";
+		return 1000000;
+	case MAX77705_PRCHG_SAMSUNG_2A:
+	case MAX77705_PRCHG_APPLE_2A:
+	case MAX77705_PRCHG_APPLE_12W:
+	case MAX77705_PRCHG_DCP_3A:
+		*why = "2 A+ charger";
+		return MAX77705_ILIM_NOPD_MAX_UA;
+	default:
+		break;
+	}
+
+	switch (FIELD_GET(MAX77705_BC_CHGTYP, bc_status)) {
+	case MAX77705_CHGTYP_DCP:
+		*why = "dedicated charger";
+		return MAX77705_ILIM_NOPD_MAX_UA;
+	case MAX77705_CHGTYP_CDP:
+		*why = "charging port";
+		return MAX77705_ILIM_CDP_UA;
+	default:
+		return 0;
+	}
+}
+
+/*
+ * The input limit while sinking without a PD contract: the Type-C current
+ * the source advertises or what the chip's BC1.2 detection found, whichever
+ * is more. Called on attach and on every event after it, since detection
+ * ends some 100 ms after VBUS (CHGTypI); a PD contract sets its own limit.
+ */
+static void max77705_usbc_nopd_ilim(struct max77705_usbc *u)
+{
+	const char *why = "USB port", *bc_why = NULL;
+	int ua = MAX77705_ILIM_SAFE_UA, bc_ua = 0;
+	unsigned int bc;
+
+	if (!u->chg_psy || u->ccstat != MAX77705_CC_SINK || u->pd_contract)
+		return;
+
+	switch (max77705_usbc_opmode(u->cc_status0)) {
+	case TYPEC_PWR_MODE_3_0A:
+		ua = MAX77705_ILIM_NOPD_MAX_UA;
+		why = "Type-C 3.0 A";
+		break;
+	case TYPEC_PWR_MODE_1_5A:
+		ua = 1500000;
+		why = "Type-C 1.5 A";
+		break;
+	default:
+		break;
+	}
+
+	if (!regmap_read(u->regmap, MAX77705_BC_STATUS, &bc))
+		bc_ua = max77705_bc_ilim_ua(bc, &bc_why);
+	if (bc_ua > ua) {
+		ua = bc_ua;
+		why = bc_why;
+	}
+
+	if (ua == u->nopd_ilim_ua)
+		return;
+	if (!max77705_usbc_set_ilim(u, ua)) {
+		u->nopd_ilim_ua = ua;
+		dev_info(u->dev, "no PD contract: %s, input limit %d mA\n",
+			 why, ua / 1000);
+	}
+}
+
 static void max77705_usbc_set_orientation(struct max77705_usbc *u,
 					  u8 cc_status0)
 {
@@ -773,6 +879,7 @@ static void max77705_usbc_pd_reset(struct max77705_usbc *u)
 {
 	cancel_delayed_work(&u->pd_retry_work);
 	u->pd_contract = false;
+	u->nopd_ilim_ua = 0;
 	u->nr_src_pdos = 0;
 	u->sel_pos = 0;
 	u->req_pos = 0;
@@ -1630,6 +1737,8 @@ static void max77705_usbc_handle_ev(struct max77705_usbc *u,
 	    ((ev->pd & MAX77705_PD_PDMSG) && ev->pdmsg == MAX77705_PDMSG_SNK_PSRDY) ||
 	    (u->ccstat == MAX77705_CC_SINK && !u->pd_contract))
 		max77705_usbc_pd_ready(u);
+
+	max77705_usbc_nopd_ilim(u);
 
 	if (u->pd_contract)
 		max77705_usbc_dp_discover(u);

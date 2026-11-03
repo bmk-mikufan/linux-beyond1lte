@@ -4163,6 +4163,53 @@ static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 #endif /* CONFIG_PM */
 
+/*
+ * With no wowl in the firmware, a host-wake line still lets the dongle stay
+ * associated while the host sleeps; Broadcom's Android driver does this on
+ * every suspend. Only unicast frames reach the host then: the offloads answer
+ * ARP and ND, and broadcast or multicast would wake it for nothing.
+ */
+#define BRCMF_HOSTWAKE_FILTER_ID	100
+
+static void brcmf_hostwake_filter(struct brcmf_cfg80211_info *cfg,
+				  struct brcmf_if *ifp, bool on)
+{
+	struct brcmf_pkt_filter_enable_le en = {
+		.id = cpu_to_le32(BRCMF_HOSTWAKE_FILTER_ID),
+		.enable = cpu_to_le32(on),
+	};
+	int err;
+
+	if (on && !cfg->wowl.filter_added) {
+		/* one byte at offset 0, the destination's I/G bit, must be 0 */
+		u8 buf[offsetof(struct brcmf_pkt_filter_le,
+				u.pattern.mask_and_pattern) + 2] = { 0 };
+		struct brcmf_pkt_filter_le *f = (void *)buf;
+		u8 *mp = buf + offsetof(struct brcmf_pkt_filter_le,
+					u.pattern.mask_and_pattern);
+
+		f->id = cpu_to_le32(BRCMF_HOSTWAKE_FILTER_ID);
+		f->u.pattern.size_bytes = cpu_to_le32(1);
+		mp[0] = 0x01;	/* mask */
+		mp[1] = 0x00;	/* pattern */
+		err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add", buf,
+					       sizeof(buf));
+		if (err) {
+			bphy_err(cfg->pub, "pkt_filter_add failed: %d\n", err);
+			return;
+		}
+		cfg->wowl.filter_added = true;
+	}
+	if (!cfg->wowl.filter_added)
+		return;
+	/* forward what matches, drop the rest */
+	brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode", 1);
+	err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable", &en, sizeof(en));
+	if (err)
+		bphy_err(cfg->pub, "pkt_filter_enable %d failed: %d\n", on, err);
+	cfg->wowl.filtering = on && !err;
+}
+
 static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
@@ -4170,6 +4217,9 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 	struct brcmf_if *ifp = netdev_priv(ndev);
 
 	brcmf_dbg(TRACE, "Enter\n");
+
+	if (cfg->wowl.filtering)
+		brcmf_hostwake_filter(cfg, ifp, false);
 
 	if (cfg->wowl.active) {
 		brcmf_report_wowl_wakeind(wiphy, ifp);
@@ -4308,6 +4358,11 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 		/* Configure MPC */
 		brcmf_set_mpc(ifp, 1);
 
+	} else if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL)) {
+		/* "any" over the host-wake line: stay associated */
+		brcmf_hostwake_filter(cfg, ifp, true);
+		brcmf_bus_wowl_config(cfg->pub->bus_if, true);
+		brcmf_keepalive_start(ifp, 30);
 	} else {
 		/* Configure WOWL parameters */
 		brcmf_configure_wowl(cfg, ifp, wowl);
@@ -7602,6 +7657,11 @@ static const struct wiphy_wowlan_support brcmf_wowlan_support = {
 	.pattern_min_len = 1,
 	.max_pkt_offset = 1500,
 };
+
+/* no wowl in the firmware, but the bus has a host-wake line */
+static const struct wiphy_wowlan_support brcmf_wowlan_any = {
+	.flags = WIPHY_WOWLAN_ANY,
+};
 #endif
 
 static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
@@ -7722,6 +7782,19 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL))
 		brcmf_wiphy_wowl_params(wiphy, ifp);
+#ifdef CONFIG_PM
+	else if (drvr->bus_if->host_wake) {
+		wiphy->wowlan = &brcmf_wowlan_any;
+		/*
+		 * Stay associated by default, as Broadcom's Android driver
+		 * does; "iw phy <phy> wowlan disable" drops the link again.
+		 * cfg80211 frees it.
+		 */
+		wiphy->wowlan_config = kzalloc_obj(*wiphy->wowlan_config);
+		if (wiphy->wowlan_config)
+			wiphy->wowlan_config->any = true;
+	}
+#endif
 	err = brcmf_fil_cmd_data_get(ifp, BRCMF_C_GET_BANDLIST, &bandlist,
 				     sizeof(bandlist));
 	if (err) {
@@ -8301,7 +8374,8 @@ static void brcmf_free_wiphy(struct wiphy *wiphy)
 		kfree(wiphy->bands[NL80211_BAND_5GHZ]);
 	}
 #if IS_ENABLED(CONFIG_PM)
-	if (wiphy->wowlan != &brcmf_wowlan_support)
+	if (wiphy->wowlan != &brcmf_wowlan_support &&
+	    wiphy->wowlan != &brcmf_wowlan_any)
 		kfree(wiphy->wowlan);
 #endif
 }

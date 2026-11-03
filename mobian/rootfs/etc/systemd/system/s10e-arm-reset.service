@@ -1,0 +1,12 @@
+[Unit]
+Description=Send unexpected S10e resets to U-Boot (Mobian), not LineageOS
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s10e-arm-reset
+
+[Install]
+WantedBy=sysinit.target

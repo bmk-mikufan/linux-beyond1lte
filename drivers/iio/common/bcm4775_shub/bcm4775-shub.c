@@ -16,8 +16,11 @@
  * (<AsicVersion=..>, <PatchAddress=..>, <Blob=hex>).
  */
 #include <linux/bitfield.h>
+#include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
+#include <linux/freezer.h>
 #include <linux/gpio/consumer.h>
 #include <linux/hex.h>
 #include <linux/iio/buffer.h>
@@ -30,6 +33,9 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
+#include <linux/pm_wakeup.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
@@ -82,6 +88,7 @@
 #define SSP_TIMESTAMP		0xa7
 #define SSP_SCANNING		0xf4
 #define SSP_FW_REV		0xf0
+#define SSP_AP_STATUS_RESUME	0xd3	/* MSG2SSP_AP_STATUS_RESUME */
 
 #define HUB_DEBUG		0x03
 #define HUB_INIT_DONE		0x0a
@@ -99,6 +106,8 @@
 
 #define SHUB_IDLE_OFF_MS	5000
 #define SHUB_FIRST_SAMPLE_MS	500
+#define SHUB_SPI_ERRORS_MAX	10	/* failed polls in a row before a bus reset */
+#define SHUB_RESUME_WINDOW_MS	2000	/* a failure this soon after a resume reboots the hub at once */
 
 static unsigned int spi_hz = 1000000;
 module_param(spi_hz, uint, 0444);
@@ -107,6 +116,11 @@ MODULE_PARM_DESC(spi_hz, "SPI clock (Hz) for hub transfers");
 static bool mcu_debug;
 module_param(mcu_debug, bool, 0644);
 MODULE_PARM_DESC(mcu_debug, "Log the hub firmware's debug text");
+
+static bool ap_sleep_signal = true;
+module_param(ap_sleep_signal, bool, 0644);
+MODULE_PARM_DESC(ap_sleep_signal,
+		 "Tell the hub about suspend and resume the way stock does");
 
 static u8 tl_crc_table[256];
 
@@ -232,7 +246,18 @@ struct shub {
 	bool ready;
 	bool need_reset;
 	unsigned int timeouts;
+	unsigned int spi_errors;
 	u64 present;
+
+	/* the SPI controller, which can come back from a resume clocking nothing */
+	void __iomem *ctl_regs;		/* read only for shub_ctl_dump() */
+	struct clk *ctl_clk[2];
+	ktime_t resumed_at;
+	bool resume_msg;		/* AP_STATUS_RESUME still to be sent */
+	bool resume_reset;		/* rebooting it for a failure after a resume */
+	unsigned int resumes, resume_fails;
+	int ctl_rpm_suspend, ctl_rpm_resume;	/* its runtime PM status then */
+	struct wakeup_source *ws;	/* held while the hub reboots */
 	u32 fw_rev;
 
 	struct shub_sensor sens[SHUB_NSENS];
@@ -520,6 +545,7 @@ static void tl_packet(struct shub *h, const u8 *b, unsigned int len)
 		dev_dbg(&h->spi->dev, "bad TL packet (len %u)\n", len);
 		return;
 	}
+	dev_dbg(&h->spi->dev, "TL packet flags %#x, %u bytes\n", flags, n);
 	if (flags & TL_INTERNAL) {
 		h->got_sync = true;
 		return;
@@ -688,6 +714,9 @@ static void ssp_frame(struct shub *h, const u8 *f, unsigned int len)
 	u8 t;
 
 	while (i < len) {
+		/* for sensor data the next byte is the sensor type */
+		dev_dbg(&h->spi->dev, "frame item %#x, next %u\n", f[i],
+			i + 1 < len ? f[i + 1] : 0);
 		switch (f[i++]) {
 		case HUB_DEBUG:
 			if (i + 2 > len)
@@ -1171,6 +1200,74 @@ static int shub_init_mcu(struct shub *h)
 	return 0;
 }
 
+/* ---------------------------------------------------------------- controller */
+
+/*
+ * The s3c64xx controller and its clocks, for the failure after a resume: its
+ * registers (not the FIFOs) and USI_CON/USI_OPTION of the USI around it, read
+ * only while it is runtime-active anyway, and each clock up to its CMU's input.
+ */
+static void shub_ctl_dump(struct shub *h, const char *why)
+{
+	static const u16 offs[] = { 0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x20, 0x28, 0xc4, 0xc8 };
+	struct device *cd = h->spi->controller->dev.parent;
+	char regs[160] = " (not active)", clks[320] = "";
+	int i, d, n = 0, m = 0;
+
+	if (h->ctl_regs && pm_runtime_get_if_active(cd) > 0) {
+		for (i = 0; i < ARRAY_SIZE(offs); i++)
+			n += scnprintf(regs + n, sizeof(regs) - n, " %02x=%08x",
+				       offs[i], readl(h->ctl_regs + offs[i]));
+		pm_runtime_put_autosuspend(cd);
+	}
+	for (i = 0; i < ARRAY_SIZE(h->ctl_clk); i++) {
+		struct clk_hw *hw = h->ctl_clk[i] ? __clk_get_hw(h->ctl_clk[i]) : NULL;
+
+		for (d = 0; hw && d < 4; d++, hw = clk_hw_get_parent(hw))
+			m += scnprintf(clks + m, sizeof(clks) - m, "%s%s %lu%s",
+				       d ? " < " : " | ", clk_hw_get_name(hw),
+				       clk_hw_get_rate(hw), clk_hw_is_enabled(hw) ? "" : " off");
+	}
+	dev_info(&h->spi->dev, "%s %lld ms after resume: rpm %d (suspend %d, resume %d) use %d%s%s%s\n",
+		 why, ktime_ms_delta(ktime_get(), h->resumed_at), cd->power.runtime_status,
+		 h->ctl_rpm_suspend, h->ctl_rpm_resume, atomic_read(&cd->power.usage_count),
+		 cd->power.needs_force_resume ? " nfr" : "", regs, clks);
+}
+
+/*
+ * After each transfer. Without stock's AP_SLEEP handshake about one s2idle
+ * resume in four, with it about one in a hundred, the hub stops answering
+ * within the first transfers: the controller's shift register stalls mid-byte
+ * while its clock runs. A runtime suspend of the controller alone does not
+ * help; letting it autosuspend and then powering the hub off and on does. Do
+ * that at the first failure after a resume rather than after ten failed
+ * polls, and keep the phone awake meanwhile: the next sleep, 2 s after a
+ * wake, used to cut the reboot short and leave the sensors dead for a minute.
+ */
+static void shub_ctl_watch(struct shub *h, int ret)
+{
+	struct device *dev = &h->spi->dev;
+	s64 since = ktime_ms_delta(ktime_get(), h->resumed_at);
+
+	if (ret >= 0) {
+		if (h->spi_errors)
+			dev_info(dev, "transfers work again after %u failed\n", h->spi_errors);
+		h->spi_errors = 0;
+		return;
+	}
+	if (++h->spi_errors > 1)
+		return;
+	shub_ctl_dump(h, "first failed transfer");
+	if (h->resumes && since < SHUB_RESUME_WINDOW_MS) {
+		h->resume_fails++;
+		dev_info(dev, "failed %lld ms after resume %u (%u of them so far), rebooting the hub\n",
+			 since, h->resumes, h->resume_fails);
+		__pm_stay_awake(h->ws);
+		h->resume_reset = true;
+		h->spi_errors = SHUB_SPI_ERRORS_MAX;
+	}
+}
+
 /* ---------------------------------------------------------------- thread */
 
 static int shub_thread(void *arg)
@@ -1179,6 +1276,12 @@ static int shub_thread(void *arg)
 	struct device *dev = &h->spi->dev;
 	int ret, i, tries = 0;
 
+	/*
+	 * Frozen with the other tasks before the SPI controller suspends: a poll
+	 * in between failed ("sync while suspend") and the hub's transfers kept
+	 * failing after resume.
+	 */
+	set_freezable();
 reboot:
 	ret = shub_boot(h);
 	if (!ret)
@@ -1189,19 +1292,36 @@ reboot:
 		mutex_unlock(&h->io_lock);
 		if (++tries < 3 && !kthread_should_stop())
 			goto reboot;
-		dev_err(dev, "giving up after %d boot attempts\n", tries);
+		dev_err(dev, "giving up after %d boot attempts, trying again after the next resume\n",
+			tries);
+		h->resume_reset = false;
+		__pm_relax(h->ws);
 		complete_all(&h->booted);
-		while (!kthread_should_stop())
-			schedule_timeout_interruptible(HZ);
-		return 0;
+		/*
+		 * Freezable, or this thread fails every suspend's freezer. A
+		 * system sleep runtime-cycles the SPI controller, which is what
+		 * clears its -EIO state, so a resume is worth another round.
+		 * One that came during the failed attempts doesn't count.
+		 */
+		WRITE_ONCE(h->resume_msg, false);
+		wait_event_freezable(h->kick, READ_ONCE(h->resume_msg) ||
+				     kthread_should_stop());
+		if (kthread_should_stop())
+			return 0;
+		tries = 0;
+		goto reboot;
 	}
 	tries = 0;
 	dev_info(dev, "hub firmware %u (rev %u) running, sensors %#llx\n",
 		 h->version[1], h->fw_rev, h->present);
+	/* freshly booted: no resume to report, and it has not slept */
+	h->resume_msg = false;
+	h->resume_reset = false;
+	__pm_relax(h->ws);
 	complete_all(&h->booted);
 	if (!h->compass_added && (h->present & BIT_ULL(SENSOR_MAG))) {
 		h->compass_added = true;
-		schedule_work(&h->compass_work);
+		queue_work(system_freezable_wq, &h->compass_work);
 	}
 
 	/* sensors that were in use before a reset come back */
@@ -1219,7 +1339,7 @@ reboot:
 		if (ret)
 			dev_warn(dev, "compass did not start: %d\n", ret);
 		else
-			schedule_delayed_work(&h->idle_work, HZ);
+			queue_delayed_work(system_freezable_wq, &h->idle_work, HZ);
 	}
 	mutex_unlock(&h->sens_lock);
 
@@ -1234,10 +1354,45 @@ reboot:
 			to = msecs_to_jiffies(active ? 100 : 1000);
 		else
 			to = msecs_to_jiffies(active ? 10 : 200);
-		wait_event_interruptible_timeout(h->kick,
-			atomic_read(&h->irq_pending) || h->need_reset ||
-			kthread_should_stop(), to);
+		wait_event_freezable_timeout(h->kick,
+			atomic_read(&h->irq_pending) || h->need_reset || h->resume_reset ||
+			READ_ONCE(h->resume_msg) || kthread_should_stop(), to);
 		atomic_set(&h->irq_pending, 0);
+		if (READ_ONCE(h->resume_msg)) {
+			WRITE_ONCE(h->resume_msg, false);
+			if (ap_sleep_signal) {
+				ret = ssp_cmd(h, SSP_AP_STATUS_RESUME, AP2HUB_WRITE,
+					      NULL, NULL, 0);
+				if (ret != -EAGAIN)
+					shub_ctl_watch(h, ret);
+			}
+		}
+		if (h->spi_errors >= SHUB_SPI_ERRORS_MAX) {
+			/*
+			 * After a long s2idle the s3c64xx controller can come
+			 * back clocking nothing (every transfer -EIO, RX FIFO
+			 * never fills) and stays so while the 100 ms poll
+			 * keeps it runtime-active. A runtime suspend/resume
+			 * re-initialises it, so go quiet past its 2 s
+			 * autosuspend before booting the hub again.
+			 */
+			mutex_lock(&h->io_lock);
+			h->ready = false;
+			mutex_unlock(&h->io_lock);
+			h->spi_errors = 0;
+			h->need_reset = false;
+			h->timeouts = 0;
+			if (!h->resume_reset)
+				dev_warn(dev, "SPI transfers failing, resetting the bus and the hub\n");
+			/*
+			 * After a resume too: booting the hub at once failed all
+			 * three tries (2026-11-03). The wakeup source keeps the
+			 * phone up through the quiet.
+			 */
+			wait_event_freezable_timeout(h->kick, kthread_should_stop(),
+						     msecs_to_jiffies(3000));
+			goto reboot;
+		}
 		if (h->need_reset) {
 			dev_warn(dev, "hub stopped answering, rebooting it\n");
 			h->need_reset = false;
@@ -1246,9 +1401,12 @@ reboot:
 		}
 		mutex_lock(&h->io_lock);
 		/* an edge IRQ: keep reading while the line stays up */
-		for (i = 0; i < 32; i++)
-			if (shub_ssi_read(h) <= 0 && !gpiod_get_value(h->host_req))
+		for (i = 0; i < 32; i++) {
+			ret = shub_ssi_read(h);
+			shub_ctl_watch(h, ret);
+			if (ret <= 0 && !gpiod_get_value(h->host_req))
 				break;
+		}
 		mutex_unlock(&h->io_lock);
 	}
 	return 0;
@@ -1258,6 +1416,11 @@ static irqreturn_t shub_irq(int irq, void *arg)
 {
 	struct shub *h = arg;
 
+	/*
+	 * No AP_SLEEP pulse here: stock pulses it from the SHUB_INT handler
+	 * (gpa4-0, the HiFi batching timestamp line), not from HOST_REQ.
+	 * Pulsing it on every HOST_REQ stopped the hub streaming any sensor.
+	 */
 	atomic_set(&h->irq_pending, 1);
 	wake_up(&h->kick);
 	return IRQ_HANDLED;
@@ -1285,7 +1448,7 @@ static void shub_idle_work(struct work_struct *w)
 	}
 	mutex_unlock(&h->sens_lock);
 	if (any)
-		schedule_delayed_work(&h->idle_work, HZ);
+		queue_delayed_work(system_freezable_wq, &h->idle_work, HZ);
 }
 
 /* ---------------------------------------------------------------- IIO */
@@ -1305,7 +1468,7 @@ static int shub_get_sample(struct shub_sensor *s, u8 *out, unsigned int n)
 	mutex_unlock(&h->sens_lock);
 	if (ret)
 		return ret;
-	schedule_delayed_work(&h->idle_work, HZ);
+	queue_delayed_work(system_freezable_wq, &h->idle_work, HZ);
 	wake_up(&h->kick);
 	if (!wait_event_timeout(s->wait, s->have_sample,
 				msecs_to_jiffies(SHUB_FIRST_SAMPLE_MS)))
@@ -1516,7 +1679,7 @@ static int shub_compass_set(struct iio_dev *indio, bool on)
 	}
 	mutex_unlock(&h->sens_lock);
 	if (on && !ret) {
-		schedule_delayed_work(&h->idle_work, HZ);
+		queue_delayed_work(system_freezable_wq, &h->idle_work, HZ);
 		wake_up(&h->kick);
 	}
 	return ret;
@@ -1672,6 +1835,27 @@ static int shub_probe(struct spi_device *spi)
 	if (ret)
 		goto err_reg;
 
+	if (dev_is_platform(spi->controller->dev.parent)) {
+		struct device *cd = spi->controller->dev.parent;
+		struct resource *res = platform_get_resource(to_platform_device(cd),
+							     IORESOURCE_MEM, 0);
+		struct clk *c;
+
+		/* the USI's registers follow the controller's in the same page */
+		if (res)
+			h->ctl_regs = devm_ioremap(dev, res->start, 0x100);
+		c = of_clk_get_by_name(cd->of_node, "spi");
+		h->ctl_clk[0] = IS_ERR(c) ? NULL : c;
+		c = of_clk_get_by_name(cd->of_node, "spi_busclk0");
+		h->ctl_clk[1] = IS_ERR(c) ? NULL : c;
+	}
+
+	h->ws = wakeup_source_register(dev, "bcm4775-shub-reset");
+	if (!h->ws) {
+		ret = -ENOMEM;
+		goto err_reg;
+	}
+
 	h->irq = gpiod_to_irq(h->host_req);
 	if (h->irq > 0) {
 		ret = devm_request_irq(dev, h->irq, shub_irq, IRQF_TRIGGER_RISING,
@@ -1685,10 +1869,12 @@ static int shub_probe(struct spi_device *spi)
 	h->thread = kthread_run(shub_thread, h, "bcm4775-shub");
 	if (IS_ERR(h->thread)) {
 		ret = PTR_ERR(h->thread);
-		goto err_reg;
+		goto err_ws;
 	}
 	return 0;
 
+err_ws:
+	wakeup_source_unregister(h->ws);
 err_reg:
 	regulator_disable(h->vdd);
 	return ret;
@@ -1704,7 +1890,43 @@ static void shub_remove(struct spi_device *spi)
 	gpiod_set_value(h->mcu_req, 0);
 	gpiod_set_value(h->pwr_en, 0);
 	regulator_disable(h->vdd);
+	clk_put(h->ctl_clk[0]);
+	clk_put(h->ctl_clk[1]);
+	wakeup_source_unregister(h->ws);
 }
+
+/*
+ * The hub suspends before its controller and resumes after it. Like stock:
+ * an AP_SLEEP pulse says the AP is going to sleep, and AP_STATUS_RESUME, sent
+ * by the thread once it thaws, that it is back.
+ */
+static int shub_suspend(struct device *dev)
+{
+	struct shub *h = dev_get_drvdata(dev);
+
+	h->ctl_rpm_suspend = h->spi->controller->dev.parent->power.runtime_status;
+	if (ap_sleep_signal) {
+		gpiod_set_value(h->ap_sleep, 0);
+		usleep_range(1000, 1100);
+		gpiod_set_value(h->ap_sleep, 1);
+	}
+	return 0;
+}
+
+static int shub_resume(struct device *dev)
+{
+	struct shub *h = dev_get_drvdata(dev);
+
+	h->ctl_rpm_resume = h->spi->controller->dev.parent->power.runtime_status;
+	h->resumed_at = ktime_get();
+	h->resumes++;
+	gpiod_set_value(h->ap_sleep, 1);
+	WRITE_ONCE(h->resume_msg, true);
+	wake_up(&h->kick);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(shub_pm, shub_suspend, shub_resume);
 
 static const struct of_device_id shub_of_match[] = {
 	{ .compatible = "brcm,bcm4775-shub" },
@@ -1722,6 +1944,7 @@ static struct spi_driver shub_driver = {
 	.driver = {
 		.name = "bcm4775-shub",
 		.of_match_table = shub_of_match,
+		.pm = pm_sleep_ptr(&shub_pm),
 	},
 	.probe = shub_probe,
 	.remove = shub_remove,

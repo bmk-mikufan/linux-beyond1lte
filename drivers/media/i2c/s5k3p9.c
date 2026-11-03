@@ -8,7 +8,8 @@
  * powered only while it streams: stream on powers it, loads the stock global
  * and mode tables, applies the controls and starts it; stream off stops it
  * and powers it off. A lens (lens-focus in DT) is bound through
- * v4l2_async_register_subdev_sensor().
+ * v4l2_async_register_subdev_sensor(), and is powered while the sensor
+ * streams, through its runtime PM.
  */
 
 #include <linux/clk.h>
@@ -17,6 +18,7 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
@@ -212,6 +214,9 @@ struct s5k3p9 {
 
 	const struct s5k_mode *mode;
 	bool streaming;
+
+	struct device *lens;	/* lens-focus, once found */
+	bool lens_on;
 };
 
 static inline struct s5k3p9 *to_s5k(struct v4l2_subdev *sd)
@@ -333,6 +338,28 @@ static void s5k3p9_power_off(struct s5k3p9 *s)
 	gpiod_set_value_cansleep(s->reset, 1);
 	for (i = s->data->n_supplies - 1; i >= 0; i--)
 		regulator_disable(s->supplies[i].consumer);
+}
+
+static void s5k3p9_lens_get(struct s5k3p9 *s)
+{
+	if (!s->lens) {
+		struct device_node *np = of_parse_phandle(s->client->dev.of_node, "lens-focus", 0);
+		struct i2c_client *c = np ? of_find_i2c_device_by_node(np) : NULL;
+
+		of_node_put(np);
+		if (!c)
+			return;
+		s->lens = &c->dev;
+	}
+	/* fails while no driver has the lens: the sensor streams without it */
+	s->lens_on = !pm_runtime_resume_and_get(s->lens);
+}
+
+static void s5k3p9_lens_put(struct s5k3p9 *s)
+{
+	if (s->lens_on)
+		pm_runtime_put(s->lens);
+	s->lens_on = false;
 }
 
 /* the exposure range follows the frame length */
@@ -546,6 +573,7 @@ static int s5k3p9_enable_streams(struct v4l2_subdev *sd, struct v4l2_subdev_stat
 	ret = s5k3p9_power_on(s);
 	if (ret)
 		return ret;
+	s5k3p9_lens_get(s);
 	/* the stock driver waits 3 ms before each table */
 	usleep_range(3000, 3100);
 	if (s->data->tnp)
@@ -584,6 +612,7 @@ static int s5k3p9_enable_streams(struct v4l2_subdev *sd, struct v4l2_subdev_stat
 
 err:
 	s->streaming = false;
+	s5k3p9_lens_put(s);
 	s5k3p9_power_off(s);
 	return ret;
 }
@@ -597,6 +626,7 @@ static int s5k3p9_disable_streams(struct v4l2_subdev *sd, struct v4l2_subdev_sta
 	s5k3p9_write16(s, S5K3P9_REG_STREAM, 0x0000);
 	msleep(20);
 	s->streaming = false;
+	s5k3p9_lens_put(s);
 	s5k3p9_power_off(s);
 	return 0;
 }
@@ -727,8 +757,11 @@ static void s5k3p9_remove(struct i2c_client *client)
 	v4l2_subdev_cleanup(sd);
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(&s->ctrls);
-	if (s->streaming)
+	if (s->streaming) {
+		s5k3p9_lens_put(s);
 		s5k3p9_power_off(s);
+	}
+	put_device(s->lens);
 }
 
 static const struct of_device_id s5k3p9_of_match[] = {

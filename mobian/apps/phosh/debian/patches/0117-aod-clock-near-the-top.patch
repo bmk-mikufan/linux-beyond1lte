@@ -1,0 +1,195 @@
+From: pulpoff <pashkovsky@gmail.com>
+Subject: The AOD clock sits near the top and, on the panel's clock, steps aside every two hours
+
+The AOD's content started 520 px down, close to the bottom of the S10e's screen; it now starts 80 px
+down, under the camera hole. On the panel's own clock nothing walked any more, and the panel's self move
+left the hands off the dial's centre (the kernel leaves it off now). Now the content takes a step of 3 px (9 panel pixels on the
+S10e) every two hours, round a ring of eight spots, and the panel's hands follow the dial as soon as it
+is laid out at its new place. The step comes from a CLOCK_REALTIME timer, which fires at the first wake
+after its time (s10e-sleepd wakes the phone every hour while the panel's clock runs), so it costs no
+wake of its own.
+---
+--- a/src/aod.c
++++ b/src/aod.c
+@@ -20,6 +20,9 @@
+ #include <glob.h>
+ #include <math.h>
+ #include <unistd.h>
++#include <sys/timerfd.h>
++
++#include <glib-unix.h>
+ 
+ /**
+  * PhoshAod:
+@@ -31,12 +34,16 @@
+  *
+  * With a panel that keeps a clock of its own (the S10e's S6E3FA7: a `self_clock` attribute next to `lpm`), the
+  * AOD is Samsung's: once it shows, the panel goes into its low power mode and draws analog hands over a dial
+- * drawn here, ticking by itself while the phone sleeps; the panel moves the picture against burn-in. Nothing
+- * needs to wake the phone for the time then (s10e-sleepd sees the clock run). Waking, the panel leaves low
++ * drawn here, ticking by itself while the phone sleeps. Nothing needs to wake the phone for the time then
++ * (s10e-sleepd sees the clock run). Against burn-in the content then moves a step every two hours, at the first
++ * wake after (s10e-sleepd's hourly one at the latest), and the hands go with it. Waking, the panel leaves low
+  * power mode before the AOD fades out. If the panel refuses, the AOD shows the time as before.
+  */
+ 
+ #define AOD_SHIFT 24 /* px the content wanders, against burn-in */
++/* with the panel's clock: a step of AOD_DRIFT px (9 panel pixels on the S10e) every AOD_DRIFT_PERIOD s */
++#define AOD_DRIFT 3
++#define AOD_DRIFT_PERIOD (2 * 60 * 60)
+ #define AOD_LPM_NITS "10"
+ /* the dial around the panel's hands, in panel pixels: they reach 207 px from the centre (s6e3fa7 hand image) */
+ #define DIAL_TICK_OUT 236.0
+@@ -63,6 +70,9 @@ struct _PhoshAod {
+   gboolean           lpm;      /* asked for */
+   gboolean           running;  /* the panel took it */
+   int                utcoff;
++  int                drift_fd; /* a CLOCK_REALTIME timer: it fires at the first wake after its time */
++  guint              drift_id;
++  gboolean           replace;  /* the dial moves: the hands follow once it is laid out */
+ };
+ 
+ G_DEFINE_TYPE (PhoshAod, phosh_aod, PHOSH_TYPE_LAYER_SURFACE)
+@@ -256,6 +266,65 @@ start_panel_clock (PhoshAod *self)
+ }
+ 
+ 
++/* the dial is laid out somewhere new: the panel's hands go there too */
++static void
++on_dial_allocated (PhoshAod *self)
++{
++  if (self->replace && self->running)
++    start_panel_clock (self);
++  self->replace = FALSE;
++}
++
++
++/* the spot for now, on a ring of eight around the middle, and the timer for the next */
++static void
++drift (PhoshAod *self)
++{
++  static const int ring[][2] = { { -1, -1 }, { 0, -1 }, { 1, -1 }, { 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 }, { -1, 0 } };
++  gint64 now = g_get_real_time () / G_USEC_PER_SEC;
++  struct itimerspec next = { .it_value.tv_sec = (now / AOD_DRIFT_PERIOD + 1) * AOD_DRIFT_PERIOD };
++  guint spot = (now / AOD_DRIFT_PERIOD) % G_N_ELEMENTS (ring);
++  int dx = ring[spot][0] * AOD_DRIFT, dy = ring[spot][1] * AOD_DRIFT;
++
++  if (gtk_widget_get_margin_start (self->box) != AOD_SHIFT + dx ||
++      gtk_widget_get_margin_top (self->box) != AOD_SHIFT + dy) {
++    gtk_widget_set_margin_start (self->box, AOD_SHIFT + dx);
++    gtk_widget_set_margin_end (self->box, AOD_SHIFT - dx);
++    gtk_widget_set_margin_top (self->box, AOD_SHIFT + dy);
++    gtk_widget_set_margin_bottom (self->box, AOD_SHIFT - dy);
++    self->replace = TRUE;
++  }
++  if (timerfd_settime (self->drift_fd, TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &next, NULL) < 0)
++    g_warning ("AOD drift timer: %s", g_strerror (errno));
++}
++
++
++static gboolean
++on_drift_timer (int fd, GIOCondition cond, PhoshAod *self)
++{
++  guint64 n;
++
++  /* ECANCELED: the clock was set; the spot is worked out again either way */
++  if (read (fd, &n, sizeof n) < 0 && errno != EAGAIN && errno != ECANCELED) {
++    g_warning ("AOD drift timer: %s", g_strerror (errno));
++    self->drift_id = 0;
++    return G_SOURCE_REMOVE;
++  }
++  drift (self);
++  return G_SOURCE_CONTINUE;
++}
++
++
++static void
++drift_stop (PhoshAod *self)
++{
++  g_clear_handle_id (&self->drift_id, g_source_remove);
++  if (self->drift_fd >= 0)
++    close (self->drift_fd);
++  self->drift_fd = -1;
++}
++
++
+ static gboolean
+ on_start_timeout (PhoshAod *self)
+ {
+@@ -274,6 +343,7 @@ panel_clock_failed (PhoshAod *self)
+   g_clear_handle_id (&self->start_id, g_source_remove);
+   self->use_clock = FALSE;
+   self->running = FALSE;
++  drift_stop (self);
+   show_panel_clock (self, FALSE);
+   g_message ("the panel's clock is off, showing the time");
+ }
+@@ -315,7 +385,7 @@ update_clock (PhoshAod *self)
+   gtk_label_set_label (GTK_LABEL (self->date), date);
+ 
+   if (self->use_clock) {
+-    /* the panel moves the picture itself; a new UTC offset (summer time) goes to its clock */
++    /* the content drifts on its own timer; a new UTC offset (summer time) goes to the panel's clock */
+     if (self->running && local_utc_offset () != self->utcoff)
+       start_panel_clock (self);
+     return;
+@@ -432,7 +502,7 @@ phosh_aod_constructed (GObject *object)
+   }
+   gtk_style_context_add_class (gtk_widget_get_style_context (GTK_WIDGET (self)), "phosh-aod");
+ 
+-  /* the clock sits a third down, as on Samsung's AOD; battery and app icons under it */
++  /* the clock near the top, under the camera hole; the date, battery and app icons under it */
+   self->box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+   gtk_widget_set_halign (self->box, GTK_ALIGN_CENTER);
+   gtk_widget_set_valign (self->box, GTK_ALIGN_START);
+@@ -448,6 +518,8 @@ phosh_aod_constructed (GObject *object)
+   }
+   gtk_widget_set_halign (self->dial, GTK_ALIGN_CENTER);
+   g_signal_connect (self->dial, "draw", G_CALLBACK (dial_draw_cb), self);
++  g_signal_connect_object (self->dial, "size-allocate", G_CALLBACK (on_dial_allocated), self,
++                           G_CONNECT_SWAPPED | G_CONNECT_AFTER);
+   self->date = gtk_label_new (NULL);
+   gtk_style_context_add_class (gtk_widget_get_style_context (self->date), "aod-date");
+   bottom = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+@@ -468,7 +540,7 @@ phosh_aod_constructed (GObject *object)
+     GtkWidget *spacer = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+ 
+     gtk_widget_set_vexpand (spacer, FALSE);
+-    gtk_widget_set_size_request (spacer, -1, 520);
++    gtk_widget_set_size_request (spacer, -1, 80);
+     gtk_container_add (GTK_CONTAINER (align), spacer);
+     gtk_container_add (GTK_CONTAINER (align), self->box);
+     gtk_container_add (GTK_CONTAINER (self), align);
+@@ -480,6 +552,16 @@ phosh_aod_constructed (GObject *object)
+   g_signal_connect_object (self->sources, "items-changed",
+                            G_CALLBACK (update_icons), self, G_CONNECT_SWAPPED);
+ 
++  if (self->use_clock) {
++    self->drift_fd = timerfd_create (CLOCK_REALTIME, TFD_CLOEXEC | TFD_NONBLOCK);
++    if (self->drift_fd >= 0) {
++      self->drift_id = g_unix_fd_add (self->drift_fd, G_IO_IN, (GUnixFDSourceFunc) on_drift_timer, self);
++      drift (self);
++    } else {
++      g_warning ("AOD drift timer: %s", g_strerror (errno));
++    }
++  }
++
+   update_clock (self);
+   update_icons (self);
+   gtk_widget_show_all (GTK_WIDGET (self));
+@@ -494,6 +576,7 @@ phosh_aod_dispose (GObject *object)
+ 
+   phosh_aod_set_shown (self, FALSE);
+   g_clear_handle_id (&self->start_id, g_source_remove);
++  drift_stop (self);
+   g_clear_pointer (&self->panel, g_free);
+   g_clear_object (&self->sources);
+   g_clear_object (&self->monitor);
+@@ -524,6 +607,7 @@ phosh_aod_class_init (PhoshAodClass *kla
+ static void
+ phosh_aod_init (PhoshAod *self)
+ {
++  self->drift_fd = -1;
+ }
+ 
+ 

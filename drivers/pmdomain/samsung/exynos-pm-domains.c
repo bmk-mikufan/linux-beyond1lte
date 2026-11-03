@@ -11,6 +11,7 @@
 
 #include <linux/arm-smccc.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/err.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -50,6 +51,22 @@ struct exynos_pm_domain {
 static bool tzpc_smc = true;
 module_param(tzpc_smc, bool, 0644);
 
+/*
+ * trace: log the PMU state word around every power-off, for bring-up. Each
+ * line is flushed before the next register access: netconsole prints from a
+ * thread, and a stall takes whatever it has not sent yet.
+ */
+static bool trace;
+module_param(trace, bool, 0644);
+
+#define pd_trace(fmt, ...)					\
+	do {							\
+		if (trace) {					\
+			pr_info(fmt, ##__VA_ARGS__);		\
+			pr_flush(200, false);			\
+		}						\
+	} while (0)
+
 static int exynos_pd_tzpc(struct exynos_pm_domain *pd, unsigned long mode)
 {
 	struct arm_smccc_res res;
@@ -61,6 +78,8 @@ static int exynos_pd_tzpc(struct exynos_pm_domain *pd, unsigned long mode)
 
 	pr_info("Power domain %s: TZPC %s SMC\n", pd->pd.name,
 		mode == EXYNOS_PD_TZPC_SAVE ? "save" : "restore");
+	if (trace)
+		pr_flush(200, false);
 	arm_smccc_smc(EXYNOS_SMC_PREPARE_PD_ONOFF, mode, pd->tzpc_base,
 		      EXYNOS_PD_TZPC_GROUP, 0, 0, 0, 0, &res);
 	if (res.a0) {
@@ -71,6 +90,32 @@ static int exynos_pd_tzpc(struct exynos_pm_domain *pd, unsigned long mode)
 	}
 
 	return 0;
+}
+
+/*
+ * A power-down that times out is still pending: the PMU keeps working on it
+ * with CONFIGURATION at 0 while genpd counts the domain as on, so nothing
+ * ever asks for it back. Ask for the domain back, and pair the TZPC save
+ * that went before with a restore.
+ */
+static void exynos_pd_cancel_off(struct exynos_pm_domain *pd)
+{
+	void __iomem *base = pd->base;
+	u32 states = readl_relaxed(base + 0x8), val;
+	int ret;
+
+	writel_relaxed(pd->local_pwr_cfg, base);
+	ret = readl_poll_timeout(base + 0x4, val,
+				 (val & pd->local_pwr_cfg) == pd->local_pwr_cfg,
+				 20, 20000);
+	if (ret)
+		pr_err("Power domain %s: off request not withdrawn (status 0x%x)\n",
+		       pd->pd.name, val);
+	else
+		pd_trace("Power domain %s: off withdrawn, states 0x%x -> 0x%x\n",
+			 pd->pd.name, states, readl_relaxed(base + 0x8));
+	if (pd->tzpc_base)
+		exynos_pd_tzpc(pd, EXYNOS_PD_TZPC_RESTORE);
 }
 
 static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
@@ -91,6 +136,8 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
 	}
 
 	pwr = power_on ? pd->local_pwr_cfg : 0;
+	pd_trace("Power domain %s: %s request, states 0x%x\n", domain->name,
+		 power_on ? "on" : "off", readl_relaxed(base + 0x8));
 	writel_relaxed(pwr, base);
 
 	/* Wait max 1ms, 20ms on 9820: AUD can take longer to power down */
@@ -100,12 +147,18 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
 		if (!timeout) {
 			op = (power_on) ? "enable" : "disable";
 			pr_err("Power domain %s %s failed\n", domain->name, op);
+			if (trace)
+				pr_flush(200, false);
+			if (!power_on)
+				exynos_pd_cancel_off(pd);
 			return -ETIMEDOUT;
 		}
 		timeout--;
 		cpu_relax();
 		usleep_range(80, 100);
 	}
+	pd_trace("Power domain %s: %s, states 0x%x\n", domain->name,
+		 power_on ? "on" : "off", readl_relaxed(base + 0x8));
 
 	if (power_on && pd->tzpc_base)
 		return exynos_pd_tzpc(pd, EXYNOS_PD_TZPC_RESTORE);

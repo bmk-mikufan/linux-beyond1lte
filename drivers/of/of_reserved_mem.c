@@ -32,6 +32,36 @@ static struct reserved_mem *reserved_mem __refdata = reserved_mem_array;
 static int total_reserved_mem_cnt = MAX_RESERVED_REGIONS;
 static int reserved_mem_count;
 
+/*
+ * reserved_mem_skip=<node>[,<node>...] leaves these /reserved-memory nodes
+ * out, as if they were disabled, so their memory is ordinary RAM. It finds
+ * out which of a vendor's carve-outs the hardware really needs without
+ * rebuilding the DT the boot loader hands over.
+ */
+static const char *reserved_mem_skip __initdata;
+
+static int __init reserved_mem_skip_setup(char *s)
+{
+	reserved_mem_skip = s;
+	return 0;
+}
+early_param("reserved_mem_skip", reserved_mem_skip_setup);
+
+static bool __init reserved_mem_skipped(const char *uname)
+{
+	const char *p = reserved_mem_skip;
+	size_t n = strlen(uname);
+
+	while (p && *p) {
+		const char *e = strchrnul(p, ',');
+
+		if (e - p == n && !strncmp(p, uname, n))
+			return true;
+		p = *e ? e + 1 : e;
+	}
+	return false;
+}
+
 static int __init early_init_dt_alloc_reserved_memory_arch(phys_addr_t size,
 	phys_addr_t align, phys_addr_t start, phys_addr_t end, bool nomap,
 	phys_addr_t *res_base)
@@ -291,7 +321,8 @@ void __init fdt_scan_reserved_mem_late(void)
 		int ret;
 		int len;
 
-		if (!of_fdt_device_is_available(fdt, child))
+		if (!of_fdt_device_is_available(fdt, child) ||
+		    reserved_mem_skipped(fdt_get_name(fdt, child, NULL)))
 			continue;
 
 		prop = of_flat_dt_get_addr_size_prop(child, "reg", &len);
@@ -355,6 +386,10 @@ int __init fdt_scan_reserved_mem(void)
 			continue;
 
 		uname = fdt_get_name(fdt, child, NULL);
+		if (reserved_mem_skipped(uname)) {
+			pr_info("'%s' left to the kernel (reserved_mem_skip)\n", uname);
+			continue;
+		}
 
 		err = __reserved_mem_reserve_reg(child, uname);
 		if (!err)

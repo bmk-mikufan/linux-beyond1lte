@@ -1,0 +1,4 @@
+# The always-on display: Phosh (the user's session) puts the panel into its low power mode and starts the
+# panel's own clock (panel-samsung-s6e3fa7-beyond0: lpm, self_clock) while the AOD shows.
+ACTION=="add|bind", SUBSYSTEM=="mipi-dsi", DRIVER=="panel-samsung-s6e3fa7-beyond0", \
+	RUN+="/bin/chgrp video /sys%p/lpm /sys%p/self_clock", RUN+="/bin/chmod 0664 /sys%p/lpm /sys%p/self_clock"

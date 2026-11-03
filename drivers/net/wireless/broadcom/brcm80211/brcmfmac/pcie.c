@@ -17,6 +17,9 @@
 #include <linux/io.h>
 #include <linux/random.h>
 #include <linux/unaligned.h>
+#include <linux/gpio/consumer.h>
+#include <linux/gpio/machine.h>
+#include <linux/pm_wakeup.h>
 
 #include <soc.h>
 #include <chipcommon.h>
@@ -82,6 +85,18 @@ MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.txt");
 MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.bin");
 MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.clm_blob");
 MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.txcap_blob");
+
+/*
+ * In D3 the dongle signals a packet or an event for the host on an
+ * out-of-band line instead of an interrupt (Broadcom's BCMPCIE_OOB_HOST_WAKE;
+ * the NVRAM's host_wake_opt picks the chip GPIO). With it the link to the AP
+ * can stay up while the host is suspended. The device has no DT node on the
+ * boards that need it, so the line is named here, e.g. "gpa0:7" on the
+ * Galaxy S10e.
+ */
+static char *brcmf_pcie_host_wake;
+module_param_named(host_wake, brcmf_pcie_host_wake, charp, 0444);
+MODULE_PARM_DESC(host_wake, "Host-wake GPIO as <gpiochip label>:<line>");
 
 static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
@@ -359,6 +374,10 @@ struct brcmf_pciedev_info {
 	u32 ds_enter_reqs;	/* deep sleep requests from the dongle */
 	bool irq_allocated;
 	bool wowl_enabled;
+	struct gpiod_lookup_table *wake_lookup;
+	struct gpio_desc *wake_gpio;
+	int wake_irq;
+	atomic_t wake_armed;	/* host-wake IRQ enabled, the dongle in D3 */
 	u8 dma_idx_sz;
 	void *idxbuf;
 	u32 idxbuf_sz;
@@ -2507,6 +2526,94 @@ static const struct brcmf_pcie_drvdata drvdata[] = {
 /* Forward declaration for pci_match_id() call */
 static const struct pci_device_id brcmf_pcie_devid_table[];
 
+static irqreturn_t brcmf_pcie_host_wake_isr(int irq, void *arg)
+{
+	struct brcmf_pciedev_info *devinfo = arg;
+
+	/* the line stays high until the dongle is back in D0 */
+	if (atomic_xchg(&devinfo->wake_armed, 0))
+		disable_irq_nosync(irq);
+	pm_wakeup_dev_event(&devinfo->pdev->dev, 500, true);
+	return IRQ_HANDLED;
+}
+
+static void brcmf_pcie_host_wake_free(struct brcmf_pciedev_info *devinfo)
+{
+	struct device *dev = &devinfo->pdev->dev;
+
+	if (devinfo->wake_irq > 0) {
+		disable_irq_wake(devinfo->wake_irq);
+		free_irq(devinfo->wake_irq, devinfo);
+		device_wakeup_disable(dev);
+		devinfo->wake_irq = 0;
+	}
+	if (!IS_ERR_OR_NULL(devinfo->wake_gpio))
+		gpiod_put(devinfo->wake_gpio);
+	devinfo->wake_gpio = NULL;
+	if (devinfo->wake_lookup) {
+		gpiod_remove_lookup_table(devinfo->wake_lookup);
+		kfree(devinfo->wake_lookup->table[0].key);
+		kfree(devinfo->wake_lookup);
+		devinfo->wake_lookup = NULL;
+	}
+}
+
+static void brcmf_pcie_host_wake_setup(struct brcmf_pciedev_info *devinfo,
+				       struct brcmf_bus *bus)
+{
+	struct device *dev = &devinfo->pdev->dev;
+	const char *spec = brcmf_pcie_host_wake, *sep;
+	struct gpiod_lookup_table *t;
+	unsigned int line;
+	char *chip;
+	int ret;
+
+	if (!spec || !*spec)
+		return;
+	sep = strrchr(spec, ':');
+	if (!sep || sep == spec || kstrtouint(sep + 1, 0, &line)) {
+		brcmf_err(bus, "host_wake=%s: expected <gpiochip label>:<line>\n", spec);
+		return;
+	}
+	chip = kstrndup(spec, sep - spec, GFP_KERNEL);
+	t = kzalloc(struct_size(t, table, 2), GFP_KERNEL);
+	if (!chip || !t) {
+		kfree(chip);
+		kfree(t);
+		return;
+	}
+	t->dev_id = dev_name(dev);
+	t->table[0] = (struct gpiod_lookup)GPIO_LOOKUP(chip, line, "host-wake",
+						       GPIO_ACTIVE_HIGH);
+	gpiod_add_lookup_table(t);
+	devinfo->wake_lookup = t;
+
+	devinfo->wake_gpio = gpiod_get(dev, "host-wake", GPIOD_IN);
+	if (IS_ERR(devinfo->wake_gpio)) {
+		ret = PTR_ERR(devinfo->wake_gpio);
+		goto fail;
+	}
+	ret = gpiod_to_irq(devinfo->wake_gpio);
+	if (ret < 0)
+		goto fail;
+	/* armed only from D3 entry to D0: in D0 the dongle uses INTx */
+	ret = request_irq(ret, brcmf_pcie_host_wake_isr,
+			  IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN, "brcmf_host_wake",
+			  devinfo);
+	if (ret)
+		goto fail;
+	devinfo->wake_irq = gpiod_to_irq(devinfo->wake_gpio);
+	device_wakeup_enable(dev);
+	enable_irq_wake(devinfo->wake_irq);
+	bus->host_wake = true;
+	dev_info(dev, "host wake on %s (IRQ %d)\n", spec, devinfo->wake_irq);
+	return;
+
+fail:
+	brcmf_err(bus, "host_wake=%s: %d, the link drops in suspend\n", spec, ret);
+	brcmf_pcie_host_wake_free(devinfo);
+}
+
 static int
 brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -2588,6 +2695,7 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bus->proto_type = BRCMF_PROTO_MSGBUF;
 	bus->chip = devinfo->coreid;
 	bus->wowl_supported = pci_pme_capable(pdev, PCI_D3hot);
+	brcmf_pcie_host_wake_setup(devinfo, bus);
 	bus->fwvid = drvdata[id->driver_data].vendor;
 	devinfo->fwseed = drvdata[id->driver_data].fw_seed;
 	dev_set_drvdata(&pdev->dev, bus);
@@ -2636,6 +2744,7 @@ fail_bus:
 	kfree(bus);
 fail:
 	brcmf_err(NULL, "failed %x:%x\n", pdev->vendor, pdev->device);
+	brcmf_pcie_host_wake_free(devinfo);
 	brcmf_pcie_release_resource(devinfo);
 	if (devinfo->ci)
 		brcmf_chip_detach(devinfo->ci);
@@ -2681,6 +2790,7 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 	kfree(bus);
 
 	brcmf_pcie_release_irq(devinfo);
+	brcmf_pcie_host_wake_free(devinfo);
 	brcmf_pcie_release_scratchbuffers(devinfo);
 	brcmf_pcie_release_ringbuffers(devinfo);
 	brcmf_pcie_reset_device(devinfo);
@@ -2727,6 +2837,11 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 
+	/* still associated (wowlan): from here on the dongle wakes us */
+	if (devinfo->wake_irq > 0 && devinfo->wowl_enabled &&
+	    !atomic_xchg(&devinfo->wake_armed, 1))
+		enable_irq(devinfo->wake_irq);
+
 	return 0;
 }
 
@@ -2743,6 +2858,9 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
+
+	if (devinfo->wake_irq > 0 && atomic_xchg(&devinfo->wake_armed, 0))
+		disable_irq(devinfo->wake_irq);
 
 	/* Check if device is still up and running, if so we are ready */
 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {

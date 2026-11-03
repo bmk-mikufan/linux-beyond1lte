@@ -44,6 +44,15 @@ power dialog, calls and the keyboard. Choosing the launcher: `gsettings set de.y
   * `0114-power-key-goes-straight-to-aod.patch`: the power button goes from the unlocked screen straight to the AOD.
     The lock screen made while the panel is in AOD stays transparent until the AOD goes away, and the AOD is
     stacked over it whichever was made first; waking shows the lock screen before the AOD goes.
+  * `0115-aod-fades-in-and-out.patch`: the AOD fades in and out over half a second; a blank or unblank in the
+    middle of a fade turns it around from where it got to.
+  * `0116-aod-panel-clock.patch`: where the panel has its own clock (the S10e's S6E3FA7: `lpm` and `self_clock`
+    writable), the AOD draws a dim dial and, once faded in, puts the panel into low power mode and starts the
+    panel's hands at the dial's centre: the phone then sleeps for hours with the time right. A refused clock
+    shows the time as text.
+  * `0117-aod-clock-near-the-top.patch`: the AOD's content sits near the top, under the camera hole, and on the
+    panel's clock it steps 3 px (9 panel pixels) every two hours round a ring of eight spots against burn-in,
+    the hands following the dial. The step comes from a CLOCK_REALTIME timer, so it costs no wake of its own.
   Build on the phone: `apt-get source phosh`, copy the patches in, add them to `debian/patches/series`,
   `dch -v 0.58.0-1+neo1`, `DEB_BUILD_OPTIONS="nocheck parallel=4" dpkg-buildpackage -b -uc -us`.
 * `phoc/debian/patches/` — added to Debian's phoc 0.58.0-1 as `0.58.0-1+neo1` (built on the phone in

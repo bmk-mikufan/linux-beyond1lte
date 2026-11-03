@@ -4592,6 +4592,7 @@ bool pr_flush(int timeout_ms, bool reset_on_progress)
 {
 	return __pr_flush(NULL, timeout_ms, reset_on_progress);
 }
+EXPORT_SYMBOL_GPL(pr_flush);
 
 /*
  * Delayed printk version, for scheduler-internal messages:

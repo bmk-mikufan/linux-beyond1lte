@@ -1613,8 +1613,17 @@ static int genpd_finish_resume(struct device *dev,
 	    !device_out_band_wakeup(dev))
 		return resume_noirq(dev);
 
+	/*
+	 * A runtime-suspended device needs no power to resume, and its next
+	 * runtime resume powers the domain on. Leave the domain as it is:
+	 * on Exynos9820 a domain that is powered on here and off again with
+	 * nothing in between does not finish powering down (MFC, ISPPRE and
+	 * others stay half off with genpd counting them on), and the next
+	 * access to it stalls the SoC.
+	 */
 	genpd_lock(genpd);
-	genpd_sync_power_on(genpd, true, 0);
+	if (!pm_runtime_status_suspended(dev))
+		genpd_sync_power_on(genpd, true, 0);
 	genpd->suspended_count--;
 	genpd_unlock(genpd);
 

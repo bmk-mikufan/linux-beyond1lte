@@ -1,0 +1,385 @@
+From: pulpoff <pashkovsky@gmail.com>
+Subject: The AOD uses the panel's own clock where it has one (de.yesman.neo aod)
+
+The S10e's S6E3FA7 can draw analog hands over its frame memory and tick them by itself in its low power
+mode, as Samsung's AOD does: the phone then sleeps for hours with the time right. With the panel's
+self_clock and lpm attributes writable (a udev rule gives them to the video group), the AOD draws a dim
+dial instead of the time and, once faded in, puts the panel into low power mode (10 nits) and starts its
+hands at the dial's centre, so the content no longer walks every minute (0117 moves it every two hours
+instead). Fading out, the panel leaves low power mode first. The writes go through one worker thread,
+in order, since the panel takes up to a few hundred ms. A refused clock (no hand image, a rotated
+panel) shows the time as before.
+---
+--- a/src/aod.c
++++ b/src/aod.c
+@@ -15,6 +15,12 @@
+ #include "shell-priv.h"
+ #include "wall-clock.h"
+ 
++#include <errno.h>
++#include <fcntl.h>
++#include <glob.h>
++#include <math.h>
++#include <unistd.h>
++
+ /**
+  * PhoshAod:
+  *
+@@ -22,9 +28,21 @@
+  * panel stays lit and this black overlay shows the time, the date, the battery and one icon per app
+  * with notifications. Black pixels cost nothing on OLED; the text is dim grey. The content moves a
+  * little every minute so no pixel stays lit for long.
++ *
++ * With a panel that keeps a clock of its own (the S10e's S6E3FA7: a `self_clock` attribute next to `lpm`), the
++ * AOD is Samsung's: once it shows, the panel goes into its low power mode and draws analog hands over a dial
++ * drawn here, ticking by itself while the phone sleeps; the panel moves the picture against burn-in. Nothing
++ * needs to wake the phone for the time then (s10e-sleepd sees the clock run). Waking, the panel leaves low
++ * power mode before the AOD fades out. If the panel refuses, the AOD shows the time as before.
+  */
+ 
+ #define AOD_SHIFT 24 /* px the content wanders, against burn-in */
++#define AOD_LPM_NITS "10"
++/* the dial around the panel's hands, in panel pixels: they reach 207 px from the centre (s6e3fa7 hand image) */
++#define DIAL_TICK_OUT 236.0
++#define DIAL_TICK_IN  218.0
++#define DIAL_QUARTER_IN 204.0
++#define DIAL_DOT 9.0
+ 
+ struct _PhoshAod {
+   PhoshLayerSurface  parent;
+@@ -36,6 +54,15 @@
+   GtkWidget         *icons;
+   GListModel        *sources;
+   guint              step;
++
++  /* the panel's clock */
++  char              *panel;    /* its sysfs directory, or NULL without one */
++  gboolean           use_clock;
++  GtkWidget         *dial;
++  guint              start_id;
++  gboolean           lpm;      /* asked for */
++  gboolean           running;  /* the panel took it */
++  int                utcoff;
+ };
+ 
+ G_DEFINE_TYPE (PhoshAod, phosh_aod, PHOSH_TYPE_LAYER_SURFACE)
+@@ -55,6 +82,228 @@
+   ".phosh-aod image { color: #8a8a8a; -gtk-icon-effect: dim; }";
+ 
+ 
++/* ---- the panel's clock ---- */
++
++/* One worker, in order: entering low power mode takes the panel ~150 ms, uploading the hands longer, and
++ * leaving it must not overtake a start still on its way. */
++typedef struct {
++  char     *path;
++  char     *value;
++  GWeakRef  aod;   /* told if the panel refuses its clock */
++} PanelWrite;
++
++static void panel_clock_failed (PhoshAod *self);
++
++
++static void
++panel_write_free (PanelWrite *w)
++{
++  g_weak_ref_clear (&w->aod);
++  g_free (w->path);
++  g_free (w->value);
++  g_free (w);
++}
++
++
++/* in the main thread: the last reference to the AOD may go here */
++static gboolean
++on_panel_clock_refused (gpointer data)
++{
++  PanelWrite *w = data;
++  g_autoptr (GObject) aod = g_weak_ref_get (&w->aod);
++
++  if (aod)
++    panel_clock_failed (PHOSH_AOD (aod));
++  panel_write_free (w);
++  return G_SOURCE_REMOVE;
++}
++
++
++static void
++panel_write_func (gpointer data, gpointer unused)
++{
++  PanelWrite *w = data;
++  int fd = open (w->path, O_WRONLY | O_CLOEXEC);
++  int err = 0;
++
++  if (fd < 0 || write (fd, w->value, strlen (w->value)) < 0)
++    err = errno;
++  if (fd >= 0)
++    close (fd);
++  if (err)
++    g_message ("%s <- %s: %s", w->path, w->value, g_strerror (err));
++
++  if (err && g_str_has_suffix (w->path, "/self_clock"))
++    g_idle_add (on_panel_clock_refused, w);
++  else
++    panel_write_free (w);
++}
++
++
++static void
++panel_write (PhoshAod *self, const char *attr, const char *value)
++{
++  static GThreadPool *pool;
++  PanelWrite *w = g_new0 (PanelWrite, 1);
++
++  if (!pool)
++    pool = g_thread_pool_new (panel_write_func, NULL, 1, FALSE, NULL);
++  w->path = g_build_filename (self->panel, attr, NULL);
++  w->value = g_strdup (value);
++  /* not while it is disposed: leaving low power mode needs no answer */
++  g_weak_ref_init (&w->aod, g_str_equal (attr, "self_clock") ? self : NULL);
++  g_thread_pool_push (pool, w, NULL);
++}
++
++
++/* the panel whose clock this can run: both attributes writable (a udev rule gives them to the video group) */
++static char *
++find_panel_clock (void)
++{
++  glob_t g;
++  char *dir = NULL;
++
++  if (glob ("/sys/bus/mipi-dsi/devices/*/self_clock", 0, NULL, &g))
++    return NULL;
++  for (size_t i = 0; i < g.gl_pathc && !dir; i++) {
++    g_autofree char *d = g_path_get_dirname (g.gl_pathv[i]);
++    g_autofree char *lpm = g_build_filename (d, "lpm", NULL);
++
++    if (access (g.gl_pathv[i], W_OK) == 0 && access (lpm, W_OK) == 0)
++      dir = g_steal_pointer (&d);
++  }
++  globfree (&g);
++  return dir;
++}
++
++
++static int
++local_utc_offset (void)
++{
++  g_autoptr (GDateTime) now = g_date_time_new_now_local ();
++
++  return g_date_time_get_utc_offset (now) / G_USEC_PER_SEC;
++}
++
++
++static gboolean
++dial_draw_cb (GtkWidget *dial, cairo_t *cr, PhoshAod *self)
++{
++  double s = phosh_monitor_get_fractional_scale (self->monitor);
++  double cx = gtk_widget_get_allocated_width (dial) / 2.0, cy = gtk_widget_get_allocated_height (dial) / 2.0;
++
++  cairo_set_source_rgb (cr, 0x6a / 255.0, 0x6a / 255.0, 0x6a / 255.0);
++  cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
++  for (int i = 0; i < 12; i++) {
++    double a = i * G_PI / 6, in = (i % 3 ? DIAL_TICK_IN : DIAL_QUARTER_IN) / s;
++
++    cairo_set_line_width (cr, (i % 3 ? 3.0 : 6.0) / s);
++    cairo_move_to (cr, cx + in * sin (a), cy - in * cos (a));
++    cairo_line_to (cr, cx + DIAL_TICK_OUT / s * sin (a), cy - DIAL_TICK_OUT / s * cos (a));
++    cairo_stroke (cr);
++  }
++  cairo_arc (cr, cx, cy, DIAL_DOT / s, 0, 2 * G_PI);
++  cairo_fill (cr);
++  return FALSE;
++}
++
++
++static void
++show_panel_clock (PhoshAod *self, gboolean on)
++{
++  gtk_widget_set_visible (self->dial, on);
++  gtk_widget_set_visible (self->time, !on);
++}
++
++
++/* the dial's centre in panel pixels; FALSE if the panel is not upright */
++static gboolean
++dial_centre (PhoshAod *self, int *x, int *y)
++{
++  double s = phosh_monitor_get_fractional_scale (self->monitor);
++  int lx, ly;
++
++  if (phosh_monitor_get_transform (self->monitor) != PHOSH_MONITOR_TRANSFORM_NORMAL ||
++      !gtk_widget_get_mapped (self->dial) ||
++      !gtk_widget_translate_coordinates (self->dial, GTK_WIDGET (self),
++                                         gtk_widget_get_allocated_width (self->dial) / 2,
++                                         gtk_widget_get_allocated_height (self->dial) / 2, &lx, &ly))
++    return FALSE;
++  *x = (int) round (lx * s);
++  *y = (int) round (ly * s);
++  return TRUE;
++}
++
++
++static void
++start_panel_clock (PhoshAod *self)
++{
++  g_autofree char *clock = NULL;
++  int x, y;
++
++  if (!dial_centre (self, &x, &y)) {
++    panel_clock_failed (self);
++    return;
++  }
++  self->utcoff = local_utc_offset ();
++  clock = g_strdup_printf ("analog %d %d %d 24", x, y, self->utcoff);
++  if (!self->lpm)
++    panel_write (self, "lpm", AOD_LPM_NITS);
++  self->lpm = TRUE;
++  panel_write (self, "self_clock", clock);
++  self->running = TRUE;
++  g_debug ("panel clock at %d,%d", x, y);
++}
++
++
++static gboolean
++on_start_timeout (PhoshAod *self)
++{
++  self->start_id = 0;
++  start_panel_clock (self);
++  return G_SOURCE_REMOVE;
++}
++
++
++/* the panel refused its clock (no hand image, say), or it cannot be placed: the time as before */
++static void
++panel_clock_failed (PhoshAod *self)
++{
++  if (!self->use_clock)
++    return;
++  g_clear_handle_id (&self->start_id, g_source_remove);
++  self->use_clock = FALSE;
++  self->running = FALSE;
++  show_panel_clock (self, FALSE);
++  g_message ("the panel's clock is off, showing the time");
++}
++
++
++/**
++ * phosh_aod_set_shown:
++ * @self: The AOD
++ * @shown: Whether it is fully faded in
++ *
++ * Once the AOD is on the panel, the panel's clock starts (after a moment, for the frame to get there); as it
++ * starts to go, the panel leaves its low power mode.
++ */
++void
++phosh_aod_set_shown (PhoshAod *self, gboolean shown)
++{
++  g_return_if_fail (PHOSH_IS_AOD (self));
++
++  g_clear_handle_id (&self->start_id, g_source_remove);
++  if (shown && self->use_clock && !self->running) {
++    self->start_id = g_timeout_add (300, G_SOURCE_FUNC (on_start_timeout), self);
++  } else if (!shown && self->lpm) {
++    /* leaving low power mode stops the clock too */
++    panel_write (self, "lpm", "0");
++    self->lpm = FALSE;
++    self->running = FALSE;
++  }
++}
++
++
+ static void
+ update_clock (PhoshAod *self)
+ {
+@@ -65,6 +314,13 @@
+   gtk_label_set_label (GTK_LABEL (self->time), phosh_wall_clock_get_clock (clock, TRUE));
+   gtk_label_set_label (GTK_LABEL (self->date), date);
+ 
++  if (self->use_clock) {
++    /* the panel moves the picture itself; a new UTC offset (summer time) goes to its clock */
++    if (self->running && local_utc_offset () != self->utcoff)
++      start_panel_clock (self);
++    return;
++  }
++
+   /* a slow walk around a small square, one step a minute */
+   self->step = (self->step + 1) % 16;
+   dx = ((int) (self->step % 4) - 2) * AOD_SHIFT / 2;
+@@ -182,6 +438,16 @@
+   gtk_widget_set_valign (self->box, GTK_ALIGN_START);
+   self->time = gtk_label_new (NULL);
+   gtk_style_context_add_class (gtk_widget_get_style_context (self->time), "aod-time");
++  self->panel = find_panel_clock ();
++  self->use_clock = self->panel != NULL;
++  self->dial = gtk_drawing_area_new ();
++  {
++    int d = (int) ceil (2 * (DIAL_TICK_OUT + 6) / phosh_monitor_get_fractional_scale (self->monitor));
++
++    gtk_widget_set_size_request (self->dial, d, d);
++  }
++  gtk_widget_set_halign (self->dial, GTK_ALIGN_CENTER);
++  g_signal_connect (self->dial, "draw", G_CALLBACK (dial_draw_cb), self);
+   self->date = gtk_label_new (NULL);
+   gtk_style_context_add_class (gtk_widget_get_style_context (self->date), "aod-date");
+   bottom = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+@@ -193,6 +459,7 @@
+   gtk_container_add (GTK_CONTAINER (bottom), battery);
+   gtk_container_add (GTK_CONTAINER (bottom), self->icons);
+   gtk_container_add (GTK_CONTAINER (self->box), self->time);
++  gtk_container_add (GTK_CONTAINER (self->box), self->dial);
+   gtk_container_add (GTK_CONTAINER (self->box), self->date);
+   gtk_container_add (GTK_CONTAINER (self->box), bottom);
+ 
+@@ -216,6 +483,7 @@
+   update_clock (self);
+   update_icons (self);
+   gtk_widget_show_all (GTK_WIDGET (self));
++  show_panel_clock (self, self->use_clock);
+ }
+ 
+ 
+@@ -224,6 +492,9 @@
+ {
+   PhoshAod *self = PHOSH_AOD (object);
+ 
++  phosh_aod_set_shown (self, FALSE);
++  g_clear_handle_id (&self->start_id, g_source_remove);
++  g_clear_pointer (&self->panel, g_free);
+   g_clear_object (&self->sources);
+   g_clear_object (&self->monitor);
+ 
+--- a/src/aod.h
++++ b/src/aod.h
+@@ -16,5 +16,6 @@
+ G_DECLARE_FINAL_TYPE (PhoshAod, phosh_aod, PHOSH, AOD, PhoshLayerSurface)
+ 
+ PhoshAod        *phosh_aod_new                                  (PhoshMonitor *monitor);
++void             phosh_aod_set_shown                            (PhoshAod *self, gboolean shown);
+ 
+ G_END_DECLS
+--- a/src/shell.c
++++ b/src/shell.c
+@@ -427,6 +427,9 @@
+   if (priv->aod_leaving) {
+     priv->aod_leaving = FALSE;
+     g_clear_pointer (&priv->aod, phosh_cp_widget_destroy);
++  } else if (priv->aod) {
++    /* all there: the panel's low power mode and clock */
++    phosh_aod_set_shown (priv->aod, TRUE);
+   }
+ }
+ 
+@@ -448,8 +451,11 @@
+   }
+   priv->aod_leaving = !in;
+ 
+-  if (!in)
++  if (!in) {
++    /* the panel out of its low power mode before the lock screen shows through */
++    phosh_aod_set_shown (priv->aod, FALSE);
+     no_input = cairo_region_create ();
++  }
+   gtk_widget_input_shape_combine_region (GTK_WIDGET (priv->aod), no_input);
+   g_clear_pointer (&no_input, cairo_region_destroy);
+ 

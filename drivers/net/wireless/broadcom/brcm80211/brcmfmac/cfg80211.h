@@ -320,6 +320,8 @@ struct brcmf_cfg80211_vif_event {
  * @nd_data_wait: wait queue to sync net detect data.
  * @nd_data_completed: completion for net detect data.
  * @nd_enabled: net detect enabled.
+ * @filter_added: the host-wake unicast filter is installed.
+ * @filtering: ... and enabled for this suspend.
  */
 struct brcmf_cfg80211_wowl {
 	bool active;
@@ -329,6 +331,8 @@ struct brcmf_cfg80211_wowl {
 	wait_queue_head_t nd_data_wait;
 	bool nd_data_completed;
 	bool nd_enabled;
+	bool filter_added;
+	bool filtering;
 };
 
 /**

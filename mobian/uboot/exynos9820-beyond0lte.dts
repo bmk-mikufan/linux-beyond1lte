@@ -70,17 +70,6 @@
 			no-map;
 		};
 
-		/* Free in the live S10e map. A reset keeps RAM, so the rescue
-		 * shell can read a dead boot's log from /sys/fs/pstore. */
-		ramoops@e8000000 {
-			compatible = "ramoops";
-			reg = <0x0 0xe8000000 0x200000>;
-			record-size = <0x40000>;
-			console-size = <0x100000>;
-			pmsg-size = <0x40000>;
-			ftrace-size = <0x0>;
-		};
-
 		/*
 		 * IOVA only: the MFC's window is stock's [0x10000000,
 		 * 0xd0000000) (s5p-mfc puts the firmware at its start).
@@ -96,8 +85,30 @@
 			no-map;
 		};
 
+		/*
+		 * Stock debug-snapshot area. S-Boot writes its own log near the
+		 * start, and a marker in its kernel-events part survived both a
+		 * reboot and a watchdog reset (a watchdog reset clears part of
+		 * dss_log_s2d), so ramoops lives there. systemd-pstore moves the
+		 * records to /var/lib/systemd/pstore at boot: /sys/fs/pstore
+		 * reads empty even when a dump was kept.
+		 */
 		dss_logs@fd900000 {
-			reg = <0x0 0xfd900000 0x2700000>;
+			reg = <0x0 0xfd900000 0x1f00000>;
+			no-map;
+		};
+
+		ramoops@ff800000 {
+			compatible = "ramoops";
+			reg = <0x0 0xff800000 0x200000>;
+			record-size = <0x40000>;
+			console-size = <0x100000>;
+			pmsg-size = <0x40000>;
+			ftrace-size = <0x0>;
+		};
+
+		dss_logs_tail@ffa00000 {
+			reg = <0x0 0xffa00000 0x600000>;
 			no-map;
 		};
 	};
@@ -149,6 +160,9 @@
 };
 
 &usbdrd_phy {
+	dvdd-supply = <&ldo10m>;
+	vdd18-supply = <&ldo11m>;
+	vdd30-supply = <&ldo12m>;
 	orientation-switch;
 	samsung,phy-port-gpios = <&gpg0 4 GPIO_ACTIVE_HIGH>;
 	pinctrl-names = "default";
@@ -613,6 +627,33 @@
 &acpm_ipc {
 	pmic-1 {
 		regulators {
+			/*
+			 * USB/DP combo PHY supplies, downstream "m_vdd_ldo10/11/12"
+			 * (nothing else uses them). The PHY driver switches them
+			 * with its init/exit, so they go off in every s2idle; at
+			 * the voltages S-Boot leaves.
+			 */
+			ldo10m: ldo10m {
+				regulator-name = "vdd_usb_0p85";
+				regulator-min-microvolt = <850000>;
+				regulator-max-microvolt = <850000>;
+				regulator-boot-on;
+			};
+
+			ldo11m: ldo11m {
+				regulator-name = "vdd_usb_1p8";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-boot-on;
+			};
+
+			ldo12m: ldo12m {
+				regulator-name = "vdd_usb_3p0";
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+				regulator-boot-on;
+			};
+
 			ldo17m: ldo17m {
 				regulator-name = "vdd_pmic_codec_1p8";
 				regulator-min-microvolt = <1800000>;

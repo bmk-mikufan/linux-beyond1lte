@@ -48,6 +48,8 @@
 #include <linux/regmap.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
+#include <linux/time.h>
+#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
@@ -82,9 +84,11 @@
 #define MBX_CP2AP_MSG			1
 #define MBX_AP2CP_STATUS		2
 #define MBX_CP2AP_STATUS		3
+#define MBX_AP2CP_KERNELTIME		9
 #define INT_AP2CP_MSG			0
 #define INT_AP2CP_WAKEUP		1
 #define INT_AP2CP_STATUS		2
+#define INT_AP2CP_ACTIVE		3
 #define IRQ_CP2AP_MSG			0
 #define IRQ_CP2AP_STATUS		2
 #define IRQ_CP2AP_WAKELOCK		8
@@ -97,6 +101,8 @@
 #define SBI_SYS_REV			GENMASK(13, 6)
 #define SBI_DS_DET			GENMASK(15, 14)
 #define SBI_DEVICE_TYPE			GENMASK(22, 18)
+#define SBI_KERNELTIME_SEC		GENMASK(31, 20)	/* seconds into the UTC hour */
+#define SBI_KERNELTIME_USEC		GENMASK(19, 0)
 
 /*
  * What MODEM_ON writes on Android (ap_status 0x00446a20): one SIM detected,
@@ -1860,6 +1866,50 @@ static void exynos_cp_remove(struct platform_device *pdev)
 		pm_relax(&pdev->dev);
 }
 
+/*
+ * Around every suspend stock modem_main.c tells the CP whether the AP is up:
+ * the kernel time, then pda_active cleared (set again on resume) with the
+ * "active" doorbell. A CP that knows the AP sleeps holds back what can wait
+ * (signal strength, cell and network updates) instead of waking it for each.
+ */
+static void cp_set_pda_active(struct exynos_cp *cp, bool active)
+{
+	struct timespec64 ts;
+	struct tm tm;
+	u32 st;
+
+	ktime_get_real_ts64(&ts);
+	time64_to_tm(ts.tv_sec, 0, &tm);
+	mbox_set(cp, MBX_AP2CP_KERNELTIME,
+		 FIELD_PREP(SBI_KERNELTIME_SEC, tm.tm_min * 60 + tm.tm_sec) |
+		 FIELD_PREP(SBI_KERNELTIME_USEC, ts.tv_nsec / NSEC_PER_USEC));
+
+	st = mbox_get(cp, MBX_AP2CP_STATUS) & ~SBI_PDA_ACTIVE;
+	mbox_set(cp, MBX_AP2CP_STATUS, st | (active ? SBI_PDA_ACTIVE : 0));
+	mbox_ring(cp, INT_AP2CP_ACTIVE);
+	dev_dbg(cp->dev, "pda_active %d\n", active);
+}
+
+static int exynos_cp_suspend(struct device *dev)
+{
+	struct exynos_cp *cp = dev_get_drvdata(dev);
+
+	if (READ_ONCE(cp->ipc_up))
+		cp_set_pda_active(cp, false);
+	return 0;
+}
+
+static int exynos_cp_resume(struct device *dev)
+{
+	struct exynos_cp *cp = dev_get_drvdata(dev);
+
+	if (READ_ONCE(cp->ipc_up))
+		cp_set_pda_active(cp, true);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(exynos_cp_pm_ops, exynos_cp_suspend, exynos_cp_resume);
+
 static const struct of_device_id exynos_cp_of_match[] = {
 	{ .compatible = "samsung,exynos9820-cp" },
 	{ }
@@ -1871,6 +1921,7 @@ static struct platform_driver exynos_cp_driver = {
 		.name = "exynos9820-cp",
 		.of_match_table = exynos_cp_of_match,
 		.dev_groups = cp_groups,
+		.pm = pm_sleep_ptr(&exynos_cp_pm_ops),
 	},
 	.probe = exynos_cp_probe,
 	.remove = exynos_cp_remove,

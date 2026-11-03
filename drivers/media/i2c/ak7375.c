@@ -93,7 +93,7 @@ struct ak7375_device {
 	struct v4l2_ctrl *focus;
 	struct regulator_bulk_data supplies[ARRAY_SIZE(ak7375_supply_names)];
 
-	/* active or standby mode */
+	/* powered and in active mode; changed under the control handler's lock */
 	bool active;
 };
 
@@ -134,32 +134,19 @@ static int ak7375_set_ctrl(struct v4l2_ctrl *ctrl)
 	struct ak7375_device *dev_vcm = to_ak7375_vcm(ctrl);
 	const struct ak73xx_chipdef *cdef = dev_vcm->cdef;
 
-	if (ctrl->id == V4L2_CID_FOCUS_ABSOLUTE)
-		return ak7375_i2c_write(dev_vcm, cdef->reg_position,
-					ctrl->val << cdef->shift_pos, 2);
+	if (ctrl->id != V4L2_CID_FOCUS_ABSOLUTE)
+		return -EINVAL;
 
-	return -EINVAL;
+	/* powered off, the control keeps the value and resume moves the lens there */
+	if (!dev_vcm->active)
+		return 0;
+
+	return ak7375_i2c_write(dev_vcm, cdef->reg_position,
+				ctrl->val << cdef->shift_pos, 2);
 }
 
 static const struct v4l2_ctrl_ops ak7375_vcm_ctrl_ops = {
 	.s_ctrl = ak7375_set_ctrl,
-};
-
-static int ak7375_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
-{
-	return pm_runtime_resume_and_get(sd->dev);
-}
-
-static int ak7375_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
-{
-	pm_runtime_put(sd->dev);
-
-	return 0;
-}
-
-static const struct v4l2_subdev_internal_ops ak7375_int_ops = {
-	.open = ak7375_open,
-	.close = ak7375_close,
 };
 
 static const struct v4l2_subdev_ops ak7375_ops = { };
@@ -216,7 +203,6 @@ static int ak7375_probe(struct i2c_client *client)
 
 	v4l2_i2c_subdev_init(&ak7375_dev->sd, client, &ak7375_ops);
 	ak7375_dev->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
-	ak7375_dev->sd.internal_ops = &ak7375_int_ops;
 	ak7375_dev->sd.entity.function = MEDIA_ENT_F_LENS;
 
 	ret = ak7375_init_controls(ak7375_dev);
@@ -264,10 +250,11 @@ static int __maybe_unused ak7375_vcm_suspend(struct device *dev)
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct ak7375_device *ak7375_dev = sd_to_ak7375_vcm(sd);
 	const struct ak73xx_chipdef *cdef = ak7375_dev->cdef;
-	int ret, val;
+	int ret = 0, val;
 
+	v4l2_ctrl_lock(ak7375_dev->focus);
 	if (!ak7375_dev->active)
-		return 0;
+		goto out;
 
 	for (val = ak7375_dev->focus->val & ~(cdef->ctrl_steps - 1);
 	     val >= 0; val -= cdef->ctrl_steps) {
@@ -288,12 +275,12 @@ static int __maybe_unused ak7375_vcm_suspend(struct device *dev)
 
 	ret = regulator_bulk_disable(ARRAY_SIZE(ak7375_supply_names),
 				     ak7375_dev->supplies);
-	if (ret)
-		return ret;
+	if (!ret)
+		ak7375_dev->active = false;
+out:
+	v4l2_ctrl_unlock(ak7375_dev->focus);
 
-	ak7375_dev->active = false;
-
-	return 0;
+	return ret;
 }
 
 /*
@@ -307,15 +294,16 @@ static int __maybe_unused ak7375_vcm_resume(struct device *dev)
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct ak7375_device *ak7375_dev = sd_to_ak7375_vcm(sd);
 	const struct ak73xx_chipdef *cdef = ak7375_dev->cdef;
-	int ret, val;
+	int ret = 0, val;
 
+	v4l2_ctrl_lock(ak7375_dev->focus);
 	if (ak7375_dev->active)
-		return 0;
+		goto out;
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(ak7375_supply_names),
 				    ak7375_dev->supplies);
 	if (ret)
-		return ret;
+		goto out;
 
 	/* Wait for vcm to become ready */
 	usleep_range(cdef->power_delay_us, cdef->power_delay_us + 500);
@@ -324,7 +312,9 @@ static int __maybe_unused ak7375_vcm_resume(struct device *dev)
 			       cdef->mode_active, 1);
 	if (ret) {
 		dev_err(dev, "%s I2C failure: %d\n", __func__, ret);
-		return ret;
+		regulator_bulk_disable(ARRAY_SIZE(ak7375_supply_names),
+				       ak7375_dev->supplies);
+		goto out;
 	}
 
 	for (val = ak7375_dev->focus->val % cdef->ctrl_steps;
@@ -339,8 +329,10 @@ static int __maybe_unused ak7375_vcm_resume(struct device *dev)
 	}
 
 	ak7375_dev->active = true;
+out:
+	v4l2_ctrl_unlock(ak7375_dev->focus);
 
-	return 0;
+	return ret;
 }
 
 static const struct of_device_id ak7375_of_table[] = {
@@ -351,8 +343,14 @@ static const struct of_device_id ak7375_of_table[] = {
 };
 MODULE_DEVICE_TABLE(of, ak7375_of_table);
 
+/*
+ * Powered only while in runtime use: its sensor takes it when it streams.
+ * Opening the sub-device does not power it, since libcamera keeps every lens
+ * open for as long as its camera manager lives. A system sleep powers only
+ * a lens that was in use: every power change moves the lens, which clicks.
+ */
 static const struct dev_pm_ops ak7375_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(ak7375_vcm_suspend, ak7375_vcm_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	SET_RUNTIME_PM_OPS(ak7375_vcm_suspend, ak7375_vcm_resume, NULL)
 };
 

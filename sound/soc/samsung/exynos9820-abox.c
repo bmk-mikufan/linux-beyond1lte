@@ -16,6 +16,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
+#include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
@@ -85,6 +86,10 @@
 #define ABOX_SPUM_CTRL0			0x0300
 #define ABOX_SPUM_NSRC_CHAIN(x)		(0xf << (4 + 4 * (x)))	/* OUT: 0 = WDMA, ASRC off */
 #define ABOX_SBANK_NSRC(x)		(0x0328 + 4 * (x))
+#define ABOX_SPUS_ASRC(x)		(0x2000 + 0x100 * (x))
+#define ABOX_SPUM_ASRC(x)		(0x4000 + 0x100 * (x))
+#define ABOX_ASRC_IS_PARA0		0x10	/* IS default, 17 bits */
+#define ABOX_ASRC_IS_PARA1		0x14	/* its tperiod limit, 5 % */
 
 #define ABOX_UAIF_CTRL0(x)		(0x0500 + 0x10 * (x))
 #define ABOX_UAIF_SPK_ENABLE		BIT(0)
@@ -142,11 +147,17 @@
  *  - "Call Downlink" capture: RDMA4's ring, the downlink from VSS before
  *    anything is mixed into it (SIFS0 also carries VPCMOUT, the processed
  *    uplink, so WDMA3 would hand the far end's voice back with our own on
- *    top). 2 ch S16 at 32 kHz, read out on a 5 ms timer at the DMA's pace.
+ *    top). 2 ch S16, read out on a 1 ms timer. The firmware's ring is one
+ *    VSS frame (0x500 bytes) and in the 2026-11-02 calls a new one came
+ *    every 20 ms: 16 kHz, not the 32 kHz RDMA4 is set to. Read as 32 kHz
+ *    the far end heard the voice an octave up, so the PCM takes 16000 too.
  *  - "Call Uplink" playback: RDMA6, which the call routing already sends
  *    SPUS chain 6 -> OUT6 -> SIFS2 and nothing consumes. With the "Call
  *    Uplink Switch" control on, NSRC1 takes SIFS2 instead of UAIF0, so what
  *    is played goes NSRC1 -> SPUM ASRC6 -> WDMA2 -> VSS where the mics went.
+ *    The SPUS takes RDMA6 four words a tick and a 2 ch RDMA6 drained twice
+ *    as fast as it was played, so the PCM takes 4 channels too; WDMA2 and
+ *    VSS run 2 ch 16 kHz (see gw_asrc_is).
  *    The AP programs RDMA6 itself: the firmware owns only the DMAs it opened.
  */
 #define ABOX_DAI_CALL_DL		2
@@ -154,20 +165,93 @@
 #define ABOX_DMA_UL			2	/* abox->dma[] index */
 #define ABOX_RDMA_UL			6
 #define ABOX_TAP_RDMA			4
-#define ABOX_TAP_TICK_NS		(5 * NSEC_PER_MSEC)
+#define ABOX_TAP_TICK_NS		(1 * NSEC_PER_MSEC)
 #define ABOX_SRAM_BASE			0x18d00000
 
 /*
  * SIFS2 feeds an NSRC, not a UAIF, so nothing clocks it but its counter:
  * stock sifsx_cnt_val() = aclk * 2 * (32 / width) / (ch * rate) - 1, with
  * aclk 12.288 MHz (stock leaves SIFS0, 2 ch 32-bit 48 kHz, at 0xff).
- * Parameters, not constants, until a call has shown what the bridge bit
- * wants: -1 leaves NSRC1's as the call had it, 0 clears it, 1 sets it.
+ * The SPUS takes four words a 48 kHz tick from RDMA6 whatever the counter
+ * says, so the 4 ch "Call Uplink" needs 127 (4 ch 32-bit 48 kHz): with any
+ * other value SIFS2 over- or underruns and the voice breaks up.
+ * gw_asrc_is: SIFS2 hands SPUM ASRC6 those four words as two stereo frames,
+ * 96 kHz to it, while the call programs ASRC6 for the mics' 48 kHz and VSS
+ * reads WDMA2 at 16 kHz (as it writes the downlink): left so, WDMA2 ran at
+ * 32 kHz and the far end heard the voice an octave down with half of it
+ * lost. 16384 is stock asrc_table's IS default for 48 -> 8 kHz, a ratio of
+ * 6 against the call's OS default of 98304; 0 leaves ASRC6 as the call
+ * set it.
+ * gw_bridge: -1 leaves NSRC1's bridge bit as the call had it, 0 clears it,
+ * 1 sets it. The call sets it, and with it NSRC1 kept taking UAIF0 although
+ * its select said SIFS2: the far end heard the S10e's mics (and its own
+ * voice off the earpiece), never the gateway.
  */
-static uint gw_sifs_cnt = 0xff;
+static uint gw_sifs_cnt = 0x7f;
 module_param(gw_sifs_cnt, uint, 0644);
-static int gw_bridge = -1;
+static uint gw_asrc_is = 16384;
+module_param(gw_asrc_is, uint, 0644);
+static int gw_bridge = 0;
 module_param(gw_bridge, int, 0644);
+
+/*
+ * Where in RDMA4's ring the tap reads, in bytes ahead of the DMA position:
+ * 0 copies what was just played. If the firmware clears the ring behind
+ * the DMA (the first gateway call read only zeros), the voice is ahead of
+ * it; the firmware debugfs file shows the levels around the position.
+ */
+static uint gw_tap_lead;
+module_param(gw_tap_lead, uint, 0644);
+
+/*
+ * gw_tap_mode 1 (default): RDMA4's ring is one VSS frame that the
+ * firmware replaces whole, then the DMA plays it in a burst and waits at
+ * the start (half of all samples in a call). The DMA position says little
+ * about when a frame came, so the tap watches the ring itself: a frame that
+ * has changed and then held for a tick is copied out whole. Paced against
+ * the wall clock at the PCM's rate: a frame + 2 ms behind with nothing new,
+ * the current frame goes out again (back-to-back silence frames are
+ * identical, so they never "change"); two frames ahead, a new one is
+ * dropped. 0: the old copy behind the DMA position. gw_tap_trace 1 records
+ * every change, frame, repeat and drop for
+ * debugfs exynos9820-abox/tap; writing to that file starts it over.
+ */
+static uint gw_tap_mode = 1;
+module_param(gw_tap_mode, uint, 0644);
+static bool gw_tap_trace;
+module_param(gw_tap_trace, bool, 0644);
+#define ABOX_TAP_TRACE_LEN		4096
+
+/*
+ * gw_ul_trace 1: while a call's tap runs, what WDMA2 writes into its ring
+ * (the uplink VSS reads, our "Call Uplink" once the switch is on) is copied
+ * to debugfs exynos9820-abox/ul, raw, up to ABOX_UL_TRACE_BYTES; writing to
+ * that file starts it over. The ring and CTRL0 go to the log at the start.
+ */
+static bool gw_ul_trace;
+module_param(gw_ul_trace, bool, 0644);
+#define ABOX_UL_TRACE_BYTES		SZ_4M
+#define ABOX_TAP_SLACK_MS		2	/* a frame + this, nothing new: repeat */
+#define ABOX_TAP_AHEAD_FRAMES		2	/* this many frames ahead: drop */
+enum { ABOX_TAP_EV_CHANGE = 1, ABOX_TAP_EV_FRAME, ABOX_TAP_EV_REPEAT, ABOX_TAP_EV_DROP };
+
+/*
+ * trace: 1 logs each step of the AUD power-up and power-down and of the PCM
+ * ops, 2 also every pointer read. Where it may sleep, a line is flushed
+ * before the next register access: netconsole prints from a thread, and a
+ * stall takes whatever it has not sent yet. pstore's console keeps them all.
+ */
+static int trace;
+module_param(trace, int, 0644);
+
+#define abox_trace(abox, fmt, ...)					\
+	do {								\
+		if (trace) {						\
+			dev_info((abox)->dev, fmt, ##__VA_ARGS__);	\
+			if (preemptible())				\
+				pr_flush(200, false);			\
+		}							\
+	} while (0)
 
 #define ABOX_BUFFER_BYTES		(256 * 1024)
 
@@ -207,6 +291,7 @@ struct abox {
 		struct hrtimer timer;
 		ktime_t period;
 		unsigned int sw_pos;	/* bytes, used when the DMA reports nothing */
+		bool hw_pos;		/* STATUS has moved: it has the position */
 		u32 format;
 		u32 iova;
 		size_t mapped;		/* bytes mapped at iova, 0 = none */
@@ -221,14 +306,34 @@ struct abox {
 		unsigned int pos;	/* bytes into the PCM buffer */
 		unsigned int acc;	/* bytes since the last period */
 		u32 rd;			/* bytes into the ring, U32_MAX = find it */
+		/* gw_tap_mode 1 */
+		u32 sig;		/* of the ring at the last tick */
+		bool fresh;		/* it changed: copy it once it holds */
+		ktime_t start;		/* of the frames' clock */
+		u64 out;		/* bytes sent since start */
+		struct abox_tap_ev {
+			u32 us, status, sig;
+			s32 behind;	/* bytes; < 0 ahead */
+			u32 ev;
+		} *trace;
+		unsigned int trace_n;
+		spinlock_t trace_lock;
 	} tap;
+
+	/* gw_ul_trace */
+	struct {
+		u8 *buf;
+		size_t len;
+		u32 str, rd;		/* ring start; bytes into it, U32_MAX = find it */
+		spinlock_t lock;
+	} ul;
 
 	/* NSRC1 on SIFS2: what the call had, to put back */
 	struct {
 		spinlock_t lock;
 		bool enable;		/* "Call Uplink Switch" */
 		bool on;
-		u32 ctrl1, ctrl2, cnt;
+		u32 ctrl1, ctrl2, cnt, asrc_is, asrc_lim;
 	} gw;
 
 	unsigned int fmt[ABOX_NUM_UAIF];
@@ -292,14 +397,24 @@ static int abox_cmu_init(struct abox *abox)
 	u32 val;
 	int ret;
 
+	abox_trace(abox, "cmu: PLL_AUD0 0x%08x, dividers\n",
+		   readl(abox->cmu + CMU_PLL_CON0_AUD0));
 	/* dividers first, so nothing sees 1.18 GHz when the PLL comes up */
 	ret = abox_cmu_div(abox, CMU_DIV_BUS, 6);		/* 168.5 MHz */
 	ret = ret ?: abox_cmu_div(abox, CMU_DIV_BUSP, 2);	/* 56.2 MHz */
 	ret = ret ?: abox_cmu_div(abox, CMU_DIV_AUDIF, 15);	/* 73.728 MHz */
-	ret = ret ?: abox_cmu_div(abox, CMU_DIV_CNT, 3);
+	/*
+	 * 12.288 MHz, as stock runs it in a call (abox_dump: 0x180c = 5): the
+	 * SIFS counters stock leaves (0xff for 2 ch x 32 bit at 48 kHz) are
+	 * for this clock. At /4 they ran 1.5x fast: SIFS0 drained RDMA4's
+	 * downlink ring in 6.7 of every 10 ms and the gateway's uplink (SIFS2)
+	 * played 1.5x fast with gaps.
+	 */
+	ret = ret ?: abox_cmu_div(abox, CMU_DIV_CNT, 5);
 	if (ret)
 		return ret;
 
+	abox_trace(abox, "cmu: PLL_AUD0 lock\n");
 	writel(0x96, abox->cmu + CMU_PLL_LOCKTIME_AUD0);
 	writel(AUD_PLL_K, abox->cmu + CMU_PLL_CON3_AUD0);
 	writel(AUD_PLL_CON0, abox->cmu + CMU_PLL_CON0_AUD0);
@@ -326,6 +441,7 @@ static int abox_hw_init(struct abox *abox)
 	if (ret)
 		return ret;
 
+	abox_trace(abox, "hw: IP index\n");
 	val = abox_readl(abox, ABOX_IP_INDEX);
 	if (val != ABOX_IP_INDEX_VAL) {
 		dev_err(abox->dev, "unexpected IP index 0x%08x\n", val);
@@ -337,12 +453,15 @@ static int abox_hw_init(struct abox *abox)
 	 * set up again here (they are not a "default" state, which pinctrl
 	 * would apply once at bind), then released from retention.
 	 */
+	abox_trace(abox, "hw: pins\n");
 	ret = pinctrl_select_state(abox->pinctrl, abox->pins_active);
 	if (ret)
 		return ret;
+	abox_trace(abox, "hw: pad retention release\n");
 	regmap_update_bits(abox->pmu, PMU_PAD_RETENTION_AUD,
 			   PMU_PAD_RETENTION_RELEASE, PMU_PAD_RETENTION_RELEASE);
 
+	abox_trace(abox, "hw: syspower on\n");
 	abox_writel(abox, ABOX_SYSPOWER_CTRL, 1);
 	ret = readl_poll_timeout(abox->sfr + ABOX_SYSPOWER_STATUS, val,
 				 val & 1, 10, 10000);
@@ -375,6 +494,7 @@ static int abox_hw_init(struct abox *abox)
 	abox_update(abox, ABOX_ROUTE_CTRL1, ABOX_ROUTE_NSRC(0),
 		    ABOX_ROUTE_NSRC_UAIF(ABOX_UAIF_MIC));
 
+	abox_trace(abox, "hw: up\n");
 	return 0;
 }
 
@@ -389,8 +509,11 @@ static int abox_runtime_suspend(struct device *dev)
 {
 	struct abox *abox = dev_get_drvdata(dev);
 
+	abox_trace(abox, "suspend: pins idle\n");
 	pinctrl_select_state(abox->pinctrl, abox->pins_idle);
+	abox_trace(abox, "suspend: syspower off\n");
 	abox_writel(abox, ABOX_SYSPOWER_CTRL, 0);
+	abox_trace(abox, "suspend: done\n");
 	return 0;
 }
 
@@ -452,6 +575,7 @@ static int abox_uaif_hw_params(struct snd_pcm_substream *substream,
 		return -EINVAL;
 	}
 	ratio = AUD_AUDIF_RATE / bclk - 1;
+	abox_trace(abox, "uaif%u hw_params: div %u\n", id, ratio);
 	ret = abox_cmu_div(abox, CMU_DIV_UAIF(id), ratio);
 	if (ret)
 		return ret;
@@ -474,6 +598,7 @@ static int abox_uaif_hw_params(struct snd_pcm_substream *substream,
 		return -EINVAL;
 	}
 
+	abox_trace(abox, "uaif%u hw_params: ctrl\n", id);
 	abox_writel(abox, ABOX_UAIF_CTRL1(id), ctrl1);
 	abox_writel(abox, ABOX_UAIF_CTRL0(id),
 		    ABOX_UAIF_CTRL0_RESET | ABOX_UAIF_MODE_PROVIDER);
@@ -494,6 +619,7 @@ static int abox_uaif_trigger(struct snd_pcm_substream *substream, int cmd,
 	u32 enable = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
 		     ABOX_UAIF_SPK_ENABLE : ABOX_UAIF_MIC_ENABLE;
 
+	abox_trace(abox, "uaif%d trigger %d\n", dai->id, cmd);
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
@@ -514,6 +640,7 @@ static int abox_uaif_hw_free(struct snd_pcm_substream *substream,
 {
 	struct abox *abox = snd_soc_dai_get_drvdata(dai);
 
+	abox_trace(abox, "uaif%d hw_free\n", dai->id);
 	abox_update(abox, ABOX_QCHANNEL_DISABLE, ABOX_QCH_BCLK_UAIF(dai->id), 0);
 	return 0;
 }
@@ -558,7 +685,7 @@ static struct snd_soc_dai_driver abox_dais[] = {
 			.stream_name = "Call Downlink Capture",
 			.channels_min = 2,
 			.channels_max = 2,
-			.rates = SNDRV_PCM_RATE_32000,
+			.rates = SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_32000,
 			.formats = SNDRV_PCM_FMTBIT_S16_LE,
 		},
 	},
@@ -568,7 +695,7 @@ static struct snd_soc_dai_driver abox_dais[] = {
 		.playback = {
 			.stream_name = "Call Uplink Playback",
 			.channels_min = 2,
-			.channels_max = 2,
+			.channels_max = 4,
 			.rates = SNDRV_PCM_RATE_48000,
 			.formats = SNDRV_PCM_FMTBIT_S32_LE,
 		},
@@ -616,8 +743,8 @@ static const struct snd_pcm_hardware abox_tap_hw = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE,
-	.rates = SNDRV_PCM_RATE_32000,
-	.rate_min = 32000,
+	.rates = SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_32000,
+	.rate_min = 16000,
 	.rate_max = 32000,
 	.channels_min = 2,
 	.channels_max = 2,
@@ -636,7 +763,7 @@ static const struct snd_pcm_hardware abox_ul_hw = {
 	.rate_min = 48000,
 	.rate_max = 48000,
 	.channels_min = 2,
-	.channels_max = 2,
+	.channels_max = 4,
 	.buffer_bytes_max = ABOX_BUFFER_BYTES,
 	.period_bytes_min = 1024,
 	.period_bytes_max = ABOX_BUFFER_BYTES / 2,
@@ -695,6 +822,8 @@ static int abox_pcm_open(struct snd_soc_component *component,
 	if (ret)
 		return ret;
 
+	abox_trace(abox, "pcm open: dai %d stream %d\n", abox_dai_id(substream),
+		   substream->stream);
 	switch (abox_dai_id(substream)) {
 	case ABOX_DAI_CALL_DL:
 		snd_soc_set_runtime_hwparams(substream, &abox_tap_hw);
@@ -718,6 +847,8 @@ static int abox_pcm_close(struct snd_soc_component *component,
 {
 	struct abox *abox = snd_soc_component_get_drvdata(component);
 
+	abox_trace(abox, "pcm close: dai %d stream %d\n", abox_dai_id(substream),
+		   substream->stream);
 	pm_runtime_mark_last_busy(abox->dev);
 	pm_runtime_put_autosuspend(abox->dev);
 	return 0;
@@ -748,12 +879,18 @@ static void abox_gw_update(struct abox *abox)
 		abox->gw.ctrl1 = abox_readl(abox, ABOX_ROUTE_CTRL1);
 		abox->gw.ctrl2 = abox_readl(abox, ABOX_ROUTE_CTRL2);
 		abox->gw.cnt = abox_readl(abox, ABOX_SIFS_CNT(2));
+		abox->gw.asrc_is = abox_readl(abox, ABOX_SPUM_ASRC(6) + ABOX_ASRC_IS_PARA0);
+		abox->gw.asrc_lim = abox_readl(abox, ABOX_SPUM_ASRC(6) + ABOX_ASRC_IS_PARA1);
 		ctrl2 = abox->gw.ctrl2;
 		if (gw_bridge == 0)
 			ctrl2 &= ~ABOX_ROUTE_NSRC_BRIDGE(1);
 		else if (gw_bridge == 1)
 			ctrl2 |= ABOX_ROUTE_NSRC_BRIDGE(1);
 		abox_writel(abox, ABOX_SIFS_CNT(2), gw_sifs_cnt);
+		if (gw_asrc_is) {
+			abox_writel(abox, ABOX_SPUM_ASRC(6) + ABOX_ASRC_IS_PARA0, gw_asrc_is);
+			abox_writel(abox, ABOX_SPUM_ASRC(6) + ABOX_ASRC_IS_PARA1, gw_asrc_is / 20);
+		}
 		abox_writel(abox, ABOX_ROUTE_CTRL2, ctrl2);
 		abox_writel(abox, ABOX_ROUTE_CTRL1,
 			    (abox->gw.ctrl1 & ~ABOX_ROUTE_NSRC(1)) |
@@ -766,6 +903,8 @@ static void abox_gw_update(struct abox *abox)
 			abox_writel(abox, ABOX_ROUTE_CTRL1, abox->gw.ctrl1);
 			abox_writel(abox, ABOX_ROUTE_CTRL2, abox->gw.ctrl2);
 			abox_writel(abox, ABOX_SIFS_CNT(2), abox->gw.cnt);
+			abox_writel(abox, ABOX_SPUM_ASRC(6) + ABOX_ASRC_IS_PARA0, abox->gw.asrc_is);
+			abox_writel(abox, ABOX_SPUM_ASRC(6) + ABOX_ASRC_IS_PARA1, abox->gw.asrc_lim);
 		}
 		abox->gw.on = false;
 		dev_info(abox->dev, "call uplink: NSRC1 back on the mics\n");
@@ -779,6 +918,9 @@ static int abox_pcm_hw_params(struct snd_soc_component *component,
 {
 	struct abox_dma *dma;
 
+	abox_trace((struct abox *)snd_soc_component_get_drvdata(component),
+		   "pcm hw_params: dai %d stream %d\n", abox_dai_id(substream),
+		   substream->stream);
 	if (abox_dai_id(substream) == ABOX_DAI_CALL_DL)
 		return 0;
 	dma = abox_dma(component, substream);
@@ -804,6 +946,8 @@ static int abox_pcm_prepare(struct snd_soc_component *component,
 	struct abox_dma *dma;
 	int ret;
 
+	abox_trace(abox, "pcm prepare: dai %d stream %d\n", abox_dai_id(substream),
+		   substream->stream);
 	if (abox_dai_id(substream) == ABOX_DAI_CALL_DL) {
 		abox->tap.pos = 0;
 		abox->tap.acc = 0;
@@ -812,6 +956,7 @@ static int abox_pcm_prepare(struct snd_soc_component *component,
 	}
 	dma = abox_dma(component, substream);
 	dma->sw_pos = 0;
+	dma->hw_pos = false;
 	if (dma->abox->domain) {
 		struct iommu_domain *domain = dma->abox->domain;
 		/*
@@ -826,6 +971,7 @@ static int abox_pcm_prepare(struct snd_soc_component *component,
 			iommu_unmap(domain, dma->iova, dma->mapped);
 		dma->mapped = 0;
 		/* runtime->dma_addr is physical: the card device has no IOMMU */
+		abox_trace(abox, "pcm prepare: iommu map 0x%x\n", dma->iova);
 		ret = iommu_map(domain, dma->iova, addr, map,
 				IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
 		if (ret)
@@ -849,6 +995,7 @@ static int abox_pcm_prepare(struct snd_soc_component *component,
 	 * WDMA1 while it records: END is exclusive, OFFSET is the period
 	 * size, STR_POINT the start.
 	 */
+	abox_trace(abox, "pcm prepare: dma 0x%x\n", dma->base);
 	abox_dma_write(dma, ABOX_DMA_CTRL0,
 		       FIELD_PREP(ABOX_DMA_BURST_LEN, 8) |
 		       FIELD_PREP(ABOX_DMA_FORMAT, dma->format) |
@@ -870,6 +1017,8 @@ static int abox_pcm_trigger(struct snd_soc_component *component,
 	struct abox_dma *dma;
 	u32 val;
 
+	abox_trace(abox, "pcm trigger: dai %d stream %d cmd %d\n",
+		   abox_dai_id(substream), substream->stream, cmd);
 	if (abox_dai_id(substream) == ABOX_DAI_CALL_DL) {
 		switch (cmd) {
 		case SNDRV_PCM_TRIGGER_START:
@@ -934,6 +1083,19 @@ static int abox_pcm_trigger(struct snd_soc_component *component,
 	return -EINVAL;
 }
 
+/*
+ * A DMA's position in its ring, in bytes, from STATUS. RBUF_OFFSET is the
+ * start of the period being transferred and RBUF_CNT the 16-byte units
+ * moved within it so far, so the position moves smoothly instead of in
+ * whole periods (PipeWire xruns on the jumps). WDMA1 reports the same way:
+ * 0x0f/0x1e/0x2d + CNT while Android records in 0xf00-byte periods.
+ */
+static u32 abox_dma_ring_pos(u32 status, u32 ring)
+{
+	return ((FIELD_GET(ABOX_DMA_RBUF_OFFSET, status) +
+		 FIELD_GET(ABOX_DMA_RBUF_CNT, status)) << 4) % ring;
+}
+
 static snd_pcm_uframes_t abox_pcm_pointer(struct snd_soc_component *component,
 					  struct snd_pcm_substream *substream)
 {
@@ -945,20 +1107,24 @@ static snd_pcm_uframes_t abox_pcm_pointer(struct snd_soc_component *component,
 	if (abox_dai_id(substream) == ABOX_DAI_CALL_DL)
 		return bytes_to_frames(substream->runtime, READ_ONCE(abox->tap.pos));
 	dma = abox_dma(component, substream);
+	if (trace > 1)
+		dev_info(abox->dev, "pcm pointer: dma 0x%x\n", dma->base);
 	status = abox_dma_read(dma, ABOX_DMA_STATUS);
 
 	/*
-	 * RBUF_OFFSET is the start of the period being transferred and
-	 * RBUF_CNT the 16-byte units moved within it so far, so the position
-	 * moves smoothly instead of in whole periods (PipeWire xruns on the
-	 * jumps). WDMA1 reports the same way: 0x0f/0x1e/0x2d + CNT while
-	 * Android records in 0xf00-byte periods.
+	 * Once STATUS has moved it keeps the position, PROGRESS or not: RDMA6
+	 * in a call runs in bursts and drops PROGRESS between them, and falling
+	 * back to the timer's sw_pos then put the pointer behind where it had
+	 * been. ALSA reads any step back as a wrap, a whole buffer played, so
+	 * the gateway wrote over audio not yet played and padded with silence
+	 * (1.5-2x the real rate).
 	 */
-	if (!abox_fw_owns_dma(dma) && (status & ABOX_DMA_PROGRESS))
-		pos = (FIELD_GET(ABOX_DMA_RBUF_OFFSET, status) +
-		       FIELD_GET(ABOX_DMA_RBUF_CNT, status)) << 4;
-	else
+	if (!abox_fw_owns_dma(dma) && (dma->hw_pos || (status & ABOX_DMA_PROGRESS))) {
+		dma->hw_pos = true;
+		pos = abox_dma_ring_pos(status, U32_MAX);
+	} else {
 		pos = dma->sw_pos;
+	}
 
 	return bytes_to_frames(substream->runtime,
 			       pos % snd_pcm_lib_buffer_bytes(substream));
@@ -1007,6 +1173,9 @@ static int abox_pcm_hw_free(struct snd_soc_component *component,
 {
 	struct abox_dma *dma;
 
+	abox_trace((struct abox *)snd_soc_component_get_drvdata(component),
+		   "pcm hw_free: dai %d stream %d\n", abox_dai_id(substream),
+		   substream->stream);
 	if (abox_dai_id(substream) == ABOX_DAI_CALL_DL)
 		return 0;
 	dma = abox_dma(component, substream);
@@ -1333,6 +1502,7 @@ static irqreturn_t abox_gic_irq(int irq, void *data)
 	irqreturn_t ret = IRQ_NONE;
 	u32 iar, id;
 
+	abox_trace(abox, "gic irq\n");
 	for (;;) {
 		iar = readl(abox->gicc + GICC_IAR);
 		id = iar & 0x3ff;
@@ -1605,6 +1775,125 @@ static u32 abox_call_iova(const struct abox_call_dma *d)
 	return d->capture ? IOVA_WDMA_BUF(d->id) : IOVA_RDMA_BUF(d->id);
 }
 
+/* 32 words across the ring: enough to tell one VSS frame from the next */
+static u32 abox_tap_sig(const void __iomem *io, const void *mem, u32 ring)
+{
+	u32 step = max(4u, ring / 32 & ~3u), sig = 0, at, v;
+
+	for (at = 0; at + 4 <= ring; at += step) {
+		v = io ? readl(io + at) : *(const u32 *)(mem + at);
+		sig = rol32(sig, 5) ^ v;
+	}
+	return sig;
+}
+
+/* the whole ring, from its start, into the PCM buffer */
+static void abox_tap_put(struct abox_tap *tap, struct snd_pcm_runtime *rt,
+			 unsigned int buf, const void __iomem *io,
+			 const void *mem, u32 ring)
+{
+	u32 done = 0, c;
+
+	while (done < ring) {
+		c = min(ring - done, buf - tap->pos);
+		if (io)
+			memcpy_fromio(rt->dma_area + tap->pos, io + done, c);
+		else
+			memcpy(rt->dma_area + tap->pos, mem + done, c);
+		tap->pos = (tap->pos + c) % buf;
+		tap->acc += c;
+		done += c;
+	}
+	tap->out += ring;
+}
+
+/* gw_tap_mode 1, one tick in a call; see gw_tap_mode */
+static void abox_tap_frame(struct abox_tap *tap, struct snd_pcm_runtime *rt,
+			   unsigned int buf, const void __iomem *io,
+			   const void *mem, u32 ring, u32 status, ktime_t now)
+{
+	u32 sig = abox_tap_sig(io, mem, ring), ev = 0;
+	s64 bpms = frames_to_bytes(rt, rt->rate) / MSEC_PER_SEC, behind;
+
+	if (tap->rd == U32_MAX) {	/* the first look at this ring */
+		tap->rd = 0;
+		tap->start = now;
+		tap->out = 0;
+		tap->sig = sig;
+		tap->fresh = false;
+	}
+	behind = (s64)div_u64((u64)ktime_to_ns(ktime_sub(now, tap->start)) *
+			      rt->rate, NSEC_PER_SEC) * frames_to_bytes(rt, 1) -
+		 (s64)tap->out;
+
+	if (sig != tap->sig) {
+		tap->sig = sig;
+		tap->fresh = true;
+		ev = ABOX_TAP_EV_CHANGE;
+	} else if (tap->fresh) {
+		tap->fresh = false;
+		if (behind < -(s64)ring * ABOX_TAP_AHEAD_FRAMES) {
+			ev = ABOX_TAP_EV_DROP;
+		} else {
+			abox_tap_put(tap, rt, buf, io, mem, ring);
+			ev = ABOX_TAP_EV_FRAME;
+		}
+	} else if (behind > ring + ABOX_TAP_SLACK_MS * bpms) {
+		abox_tap_put(tap, rt, buf, io, mem, ring);
+		ev = ABOX_TAP_EV_REPEAT;
+	}
+	if (ev && READ_ONCE(gw_tap_trace) && tap->trace) {
+		spin_lock(&tap->trace_lock);
+		if (tap->trace_n < ABOX_TAP_TRACE_LEN) {
+			struct abox_tap_ev *e = &tap->trace[tap->trace_n++];
+
+			e->us = ktime_to_us(ktime_sub(now, tap->start));
+			e->status = status;
+			e->sig = sig;
+			e->behind = clamp_t(s64, behind, S32_MIN, S32_MAX);
+			e->ev = ev;
+		}
+		spin_unlock(&tap->trace_lock);
+	}
+}
+
+/* gw_ul_trace, one tick in a call: what WDMA2 has written since the last */
+static void abox_ul_trace(struct abox *abox)
+{
+	u32 base = ABOX_WDMA(2), str, end, status, ring, hw, n, c;
+	const u8 __iomem *io;
+
+	str = abox_readl(abox, base + ABOX_DMA_BUF_STR);
+	end = abox_readl(abox, base + ABOX_DMA_BUF_END);
+	status = abox_readl(abox, base + ABOX_DMA_STATUS);
+	if (end <= str || str < ABOX_SRAM_BASE ||
+	    end > ABOX_SRAM_BASE + abox->sram_size || !(status & ABOX_DMA_PROGRESS))
+		return;
+	ring = end - str;
+	io = abox->sram + (str - ABOX_SRAM_BASE);
+	hw = abox_dma_ring_pos(status, ring);
+
+	spin_lock(&abox->ul.lock);
+	if (abox->ul.rd >= ring || abox->ul.str != str) {
+		abox->ul.str = str;
+		abox->ul.rd = hw;
+		spin_unlock(&abox->ul.lock);
+		dev_info(abox->dev, "ul trace: WDMA2 ring %08x+%x ctrl0 %08x\n", str, ring,
+			 abox_readl(abox, base + ABOX_DMA_CTRL0));
+		return;
+	}
+	n = (hw + ring - abox->ul.rd) % ring;
+	while (n && abox->ul.len < ABOX_UL_TRACE_BYTES) {
+		c = min3(n, ring - abox->ul.rd, (u32)(ABOX_UL_TRACE_BYTES - abox->ul.len));
+		memcpy_fromio(abox->ul.buf + abox->ul.len, io + abox->ul.rd, c);
+		abox->ul.len += c;
+		abox->ul.rd = (abox->ul.rd + c) % ring;
+		n -= c;
+	}
+	abox->ul.rd = hw;
+	spin_unlock(&abox->ul.lock);
+}
+
 /*
  * Copy out what RDMA4 has played since the last tick. Its ring sits in
  * ABOX SRAM (or in call_buf, if the firmware kept the buffer it was given);
@@ -1621,7 +1910,7 @@ static enum hrtimer_restart abox_tap_timer(struct hrtimer *timer)
 	const void *mem = NULL;
 	struct snd_pcm_runtime *rt;
 	unsigned int buf, period, frame, n = 0, c;
-	u32 base = ABOX_RDMA(ABOX_TAP_RDMA), str, end, ring = 0, status, hw;
+	u32 base = ABOX_RDMA(ABOX_TAP_RDMA), str, end, ring = 0, status, hw, lead;
 	ktime_t now = ktime_get();
 
 	if (!substream)
@@ -1643,15 +1932,19 @@ static enum hrtimer_restart abox_tap_timer(struct hrtimer *timer)
 				 ring <= CALL_BUF_SIZE)
 				mem = abox->fw.call_buf;
 		}
+		if (READ_ONCE(gw_ul_trace) && abox->ul.buf)
+			abox_ul_trace(abox);
 	}
 
-	if (io || mem) {
-		hw = ((FIELD_GET(ABOX_DMA_RBUF_OFFSET, status) +
-		       FIELD_GET(ABOX_DMA_RBUF_CNT, status)) << 4) % ring;
+	if ((io || mem) && READ_ONCE(gw_tap_mode) == 1) {
+		abox_tap_frame(tap, rt, buf, io, mem, ring, status, now);
+		tap->last = now;
+	} else if (io || mem) {
+		hw = abox_dma_ring_pos(status, ring);
 		if (tap->rd >= ring)
 			tap->rd = hw;		/* the first look at this ring */
 		n = (hw + ring - tap->rd) % ring;
-		if (n > ring / 2) {		/* fell a lap behind: skip, not replay */
+		if (n > ring * 3 / 4) {		/* fell a lap behind: skip, not replay */
 			tap->rd = hw;
 			n = 0;
 		}
@@ -1670,14 +1963,17 @@ static enum hrtimer_restart abox_tap_timer(struct hrtimer *timer)
 		tap->rd = U32_MAX;
 	}
 
+	lead = (io || mem) ? (READ_ONCE(gw_tap_lead) % ring) & ~(frame - 1) : 0;
 	while (n) {
+		u32 at = (tap->rd + lead) % ring;
+
 		c = min(n, buf - tap->pos);
 		if (io || mem)
-			c = min(c, ring - tap->rd);
+			c = min3(c, ring - tap->rd, ring - at);
 		if (io)
-			memcpy_fromio(rt->dma_area + tap->pos, io + tap->rd, c);
+			memcpy_fromio(rt->dma_area + tap->pos, io + at, c);
 		else if (mem)
-			memcpy(rt->dma_area + tap->pos, mem + tap->rd, c);
+			memcpy(rt->dma_area + tap->pos, mem + at, c);
 		else
 			memset(rt->dma_area + tap->pos, 0, c);
 		if (io || mem)
@@ -1701,8 +1997,6 @@ static enum hrtimer_restart abox_tap_timer(struct hrtimer *timer)
  * into WDMA2; the rest run 48 -> 48 kHz. Unprogrammed, they pass silence.
  */
 #define CMU_AUD_DIV_UAIF0		0x182c
-#define ABOX_SPUS_ASRC(x)		(0x2000 + 0x100 * (x))
-#define ABOX_SPUM_ASRC(x)		(0x4000 + 0x100 * (x))
 #define ASRC_CTRL_SYNC			(1 << 23 | 1 << 20)	/* OS/IS source: sync */
 #define ASRC_CTRL_RATIO_8		(3 << 4 | 3 << 2)	/* DCMF, OVSF */
 
@@ -1935,6 +2229,36 @@ static u32 abox_peak(const void __iomem *io, const void *mem, u32 bytes,
 	return peak;		/* of 32767 */
 }
 
+/*
+ * An SRAM ring's levels in eighths, starting at the DMA position: the first
+ * is about to move, the last just moved. Where the voice sits around the
+ * position says where a tap must read (gw_tap_lead).
+ */
+static void abox_show_ring(struct seq_file *s, const void __iomem *io,
+			   u32 ring, u32 status, u32 width)
+{
+	u32 hw = abox_dma_ring_pos(status, ring), step = width / 8;
+	u32 slice = ring / 8, i, j;
+
+	seq_printf(s, "  pos %4u/%u:", hw, ring);
+	for (i = 0; i < 8 && slice >= step; i++) {
+		u32 peak = 0;
+		s32 v;
+
+		for (j = 0; j + step <= slice; j += step) {
+			u32 at = (hw + i * slice + j) % ring & ~(step - 1);
+
+			if (width == 16)
+				v = (s16)readw(io + at);
+			else
+				v = (s32)readl(io + at) >> 16;
+			peak = max_t(u32, peak, abs(v));
+		}
+		seq_printf(s, " %5u", peak);
+	}
+	seq_putc(s, '\n');
+}
+
 /* per call DMA: STATUS, buffer start, peak sample of the whole buffer */
 static void abox_fw_show_call(struct seq_file *s, struct abox *abox)
 {
@@ -1957,6 +2281,10 @@ static void abox_fw_show_call(struct seq_file *s, struct abox *abox)
 			   d->capture ? 'W' : 'R', d->id,
 			   abox_readl(abox, base + ABOX_DMA_STATUS), str,
 			   abox_readl(abox, base + ABOX_DMA_VOL_FACTOR), peak);
+		if (str >= 0x18d00000 && end > str && end <= 0x18d40000)
+			abox_show_ring(s, abox->sram + str - 0x18d00000, end - str,
+				       abox_readl(abox, base + ABOX_DMA_STATUS),
+				       d->width);
 	}
 	/* the VPCMOUT/VPCMIN links, in our keep-alive streams' buffers */
 	for (i = 0; i < 2; i++) {
@@ -1991,6 +2319,93 @@ static int abox_fw_show(struct seq_file *s, void *unused)
 	if (abox->fw.in_call)
 		abox_fw_show_call(s, abox);
 	return 0;
+}
+
+static int abox_tap_show(struct seq_file *s, void *unused)
+{
+	struct abox *abox = s->private;
+	struct abox_tap *tap = &abox->tap;
+	static const char * const names[] = {
+		"?", "change", "frame", "repeat", "drop",
+	};
+	unsigned int i, n;
+
+	n = READ_ONCE(tap->trace_n);
+	seq_printf(s, "mode %u trace %d events %u (us ev behind status sig)\n",
+		   READ_ONCE(gw_tap_mode), READ_ONCE(gw_tap_trace), n);
+	for (i = 0; i < n; i++) {
+		const struct abox_tap_ev *e = &tap->trace[i];
+
+		seq_printf(s, "%u %s %d %08x %08x\n", e->us,
+			   names[e->ev < ARRAY_SIZE(names) ? e->ev : 0],
+			   e->behind, e->status, e->sig);
+	}
+	return 0;
+}
+
+static int abox_tap_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, abox_tap_show, inode->i_private);
+}
+
+/* any write starts the trace over */
+static ssize_t abox_tap_write(struct file *file, const char __user *ubuf,
+			      size_t len, loff_t *ppos)
+{
+	struct abox *abox = ((struct seq_file *)file->private_data)->private;
+	unsigned long flags;
+
+	spin_lock_irqsave(&abox->tap.trace_lock, flags);
+	abox->tap.trace_n = 0;
+	spin_unlock_irqrestore(&abox->tap.trace_lock, flags);
+	return len;
+}
+
+static const struct file_operations abox_tap_fops = {
+	.open		= abox_tap_open,
+	.read		= seq_read,
+	.write		= abox_tap_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static ssize_t abox_ul_read(struct file *file, char __user *ubuf, size_t count,
+			    loff_t *ppos)
+{
+	struct abox *abox = file->private_data;
+	unsigned long flags;
+	size_t len;
+
+	spin_lock_irqsave(&abox->ul.lock, flags);
+	len = abox->ul.len;
+	spin_unlock_irqrestore(&abox->ul.lock, flags);
+	return simple_read_from_buffer(ubuf, count, ppos, abox->ul.buf, len);
+}
+
+/* any write starts the trace over */
+static ssize_t abox_ul_write(struct file *file, const char __user *ubuf,
+			     size_t len, loff_t *ppos)
+{
+	struct abox *abox = file->private_data;
+	unsigned long flags;
+
+	spin_lock_irqsave(&abox->ul.lock, flags);
+	abox->ul.len = 0;
+	abox->ul.rd = U32_MAX;
+	spin_unlock_irqrestore(&abox->ul.lock, flags);
+	return len;
+}
+
+static const struct file_operations abox_ul_fops = {
+	.open		= simple_open,
+	.read		= abox_ul_read,
+	.write		= abox_ul_write,
+	.llseek		= default_llseek,
+};
+
+static void abox_ul_free(void *buf)
+{
+	vfree(buf);
 }
 
 static int abox_fw_open(struct inode *inode, struct file *file)
@@ -2254,7 +2669,15 @@ static int abox_probe(struct platform_device *pdev)
 	}
 	hrtimer_setup(&abox->tap.timer, abox_tap_timer, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_REL);
+	spin_lock_init(&abox->tap.trace_lock);
+	abox->tap.trace = devm_kcalloc(dev, ABOX_TAP_TRACE_LEN,
+				       sizeof(*abox->tap.trace), GFP_KERNEL);
 	spin_lock_init(&abox->gw.lock);
+	spin_lock_init(&abox->ul.lock);
+	abox->ul.rd = U32_MAX;
+	abox->ul.buf = vmalloc(ABOX_UL_TRACE_BYTES);
+	if (abox->ul.buf && devm_add_action_or_reset(dev, abox_ul_free, abox->ul.buf))
+		abox->ul.buf = NULL;
 
 	/*
 	 * No register access here: the domain is still in the state S-Boot
@@ -2275,6 +2698,10 @@ static int abox_probe(struct platform_device *pdev)
 	debugfs_create_file("regs", 0400, dir, abox, &abox_regs_fops);
 	if (abox->gicd)
 		debugfs_create_file("firmware", 0600, dir, abox, &abox_fw_fops);
+	if (abox->tap.trace)
+		debugfs_create_file("tap", 0600, dir, abox, &abox_tap_fops);
+	if (abox->ul.buf)
+		debugfs_create_file("ul", 0600, dir, abox, &abox_ul_fops);
 
 	return devm_snd_soc_register_component(dev, &abox_component, abox_dais,
 					       ARRAY_SIZE(abox_dais));

@@ -2,8 +2,9 @@ Mobian on the Galaxy S10e (beyond0lte, SM-G970F)
 ===============================================
 
 The userspace half of running this kernel on the phone: the boot loader, the initramfs, the services and
-configuration the hardware needs on Mobian (Debian trixie with Mobian's repository, Phosh), the recovery
-zip that installs it, the camera stack, and the Neo launcher and apps the image ships.
+configuration the hardware needs on Mobian (Debian trixie with Mobian's repository, Phosh), the daemon that
+puts the phone to sleep, the recovery zip that installs it, the camera stack, and the Neo launcher and apps
+the image ships.
 The kernel is the rest of this repository; see the top-level README.md.
 
 `rootfs/` mirrors where each file goes on the phone.
@@ -15,7 +16,9 @@ Built from [chiffathefox/u-boot](https://github.com/chiffathefox/u-boot) (branch
 `u-boot-s10e.patch` applied. The patch adds `exynos9820-beyond0lte.dts` (copied here too, with the
 dtsi files it changes) and the boot environment `exynos-mobile.env`.
 
-* The DTB U-Boot is built with is the one Linux gets (`booti ... ${fdtcontroladdr}`).
+* The DTB U-Boot is built with is the one Linux gets (`booti ... ${fdtcontroladdr}`). Besides the hardware it
+  has the SoC watchdog, ramoops inside stock's debug-snapshot area (a watchdog reset keeps it), and the USB PHY's
+  own supplies, which the PHY driver switches off in every sleep.
 * `repack.py` wraps `u-boot.bin` into LineageOS's recovery image header, padded to the partition size;
   write the result to the recovery partition (`dd of=/dev/disk/by-partlabel/recovery`) from Linux, or
   from Android with root.
@@ -59,14 +62,32 @@ Services and configuration
 | `ucm2/conf.d/S10e` | ALSA UCM for the speaker and microphone. |
 | `NetworkManager/conf.d` | Wi-Fi uses the chip's own MAC (the one Android uses); usb0/usb1 stay with the gadget. |
 | `gmobile/display-panels/samsung,beyond0lte.json`, `phosh.service.d/user.conf` | The camera hole for Phosh (G_RESOURCE_OVERLAYS, since gmobile has no S10e entry). |
-| `boot/s10e/bootargs.env` | The kernel command line U-Boot reads. |
+| `boot/s10e/bootargs.env` | The kernel command line U-Boot reads; its `reserved_mem_skip=` gives four of the vendor's carve-outs (449 MiB) to the kernel. |
 | `s10e-firstboot(.service)` | First boot of a fresh install: copies the Wi-Fi, Bluetooth, audio and MFC firmware from the phone's own `/vendor` (mounted read-only), seeds the modem's NV data from `efs` (read-only), and reboots once so the drivers load it. |
 | `neo-dock(.service)`, `71-neo-dock.rules`, `gnome-desktop.service` | Docked mode: with an HDMI display on USB-C, Phosh gives way to a GNOME desktop on the TV, and comes back on undock. |
 | `neo-cec@.service`, `neo-cec-recheck.*`, `neo-cec-probe`, `72-neo-cec.rules`, `neo-cec.conf` | HDMI CEC through docks that tunnel it over DP AUX: the phone claims a playback address and becomes the active source. |
 | `s10e-camera.conf`, `60-libcamera-softisp.conf`, `60-neo-snapshot.gschema.override` | Camera modules and libcamera's GPU software ISP; the camera app's defaults. |
 | `60-s10e-audio.conf` | WirePlumber settings for the S10e card. |
-| `61-s10e-watchdog.conf`, `s10e-persistent.conf` | Leaves systemd's watchdog unarmed (`watchdog0` is only softdog: the device tree has no hardware watchdog yet); a persistent journal. |
+| `s10e-sleepd(.service)`, `s10e-sleepd.conf` | Puts the phone to sleep when the screen is off; see Sleep below. logind's `sleep.target` and `suspend.target` are masked on the phone. |
+| `brcmfmac-hostwake.conf` | `host_wake=gpa0:7`: the Wi-Fi dongle's out-of-band wake line, so Wi-Fi stays associated through a sleep and a unicast frame wakes the phone. |
+| `90-s10e-watchdog.conf`, `90-s10e-watchdog.rules` | systemd feeds the SoC watchdog (`/dev/watchdog-s10e`: softdog races it for `watchdog0`) with a 60 s timeout; a stalled SoC resets by itself. |
+| `s10e-arm-reset(.service)` | Points S-Boot at the recovery partition (U-Boot) for a reset the kernel does not announce (watchdog, panic): without it such a reset boots LineageOS. |
+| `60-hang-panic.conf`, `61-s10e-hang.conf`, `s10e-persistent.conf` | A hung task, soft or hard lockup panics and reboots after 10 s, with the trace in pstore (systemd-pstore keeps it in `/var/lib/systemd/pstore`); a persistent journal. |
+| `62-s10e-wake-gesture.rules`, `63-s10e-panel-aod.rules` | Give the user's session the touchscreen's `wake_gesture` (double tap to wake) and the panel's `lpm` and `self_clock` (the AOD on the panel's own clock). |
 | `s10e-input` | Synthetic taps and swipes on the touchscreen, for testing. |
+
+Sleep (`sleepd/`)
+=================
+
+`s10e-sleepd` (C, GIO) suspends the phone to idle a few seconds after the screen goes off, whenever nothing needs
+it awake, the way Android does it rather than through logind: logind's suspend targets stay masked, gsd-power's
+idle suspend is set to nothing, and no program hears about a sleep, so a call that wakes the phone rings on a
+screen only the call turns on. It stays awake for logind `sleep` block inhibitors, gnome-session's suspend
+inhibitors, ModemManager calls, running ALSA PCMs, active kernel wakeup sources (`exynos-cpd`'s wakelocks, the
+modem driver's), a few seconds after a wake, and the first two minutes after boot. With the AOD showing, an RTC
+alarm wakes it every minute to draw the new time, or once an hour while the panel's own clock runs.
+`/etc/s10e-sleepd.conf` has the settings; `s10e.nosleep` on the kernel command line turns it off.
+`sleepd/README.md` has the rest.
 
 Recovery zip (`zip/`)
 =====================
@@ -89,6 +110,12 @@ commands through DSIM0 from userspace (`w <bytes>`, `r <reg> <n>`); `gen.py` tur
 into scripts per mode (Auto, Natural, Standard, Dynamic) and night-light levels. The panel driver loads
 Natural at every power-up.
 
+`aod/` makes the hand image for the panel's own AOD clock (`/lib/firmware/samsung/s6e3fa7-beyond0-aod-hands.bin`,
+360x120 RGBA, three bands for the hour, minute and second hands): `hands-from-samsung.py` takes it out of
+Samsung's GPL kernel header `s6e3fa7_analog_clock_img.h`, and `hands-clean-second.py IN OUT none` leaves the
+second hand out (`line` draws it as a plain line instead of Samsung's, whose counterweight ring reads as a
+second centre). `echo reload > .../self_clock` makes the driver read the file again.
+
 Cameras (`camera/`)
 ===================
 
@@ -107,8 +134,8 @@ Launcher and apps (`apps/`)
 * `neo-settings/`: Neo Settings, a GTK 4 settings app. `neo-weather/`: the weather app and widget.
 * `compass/`, `neo-browser/`: the compass and the browser (GJS).
 * `phosh/debian/patches/`, `phoc/debian/patches/`: patches on Debian's Phosh and phoc 0.58.0 (the launcher
-  hooks, Neo's recents, the pattern lock, the Always On Display and double tap to wake, rotation without a
-  modeset...). `README.md` describes each one and
+  hooks, Neo's recents, the pattern lock, the Always On Display, on the panel's own clock where it has one,
+  and double tap to wake, rotation without a modeset...). `README.md` describes each one and
   how they are built; `build-debs.sh` builds the packages.
 
 Out-of-tree modules (`modules/`)

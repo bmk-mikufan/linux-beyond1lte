@@ -2263,6 +2263,34 @@ static bool exynos9820_ss = true;
 module_param_named(exynos9820_ss, exynos9820_ss, bool, 0444);
 MODULE_PARM_DESC(exynos9820_ss, "Exynos9820: bring up the SuperSpeed (USB/DP combo) PHY");
 
+/*
+ * The PHY's own supplies (downstream "m_vdd_ldo10/11/12", S2MPS19 LDO10/11/12M,
+ * nothing else on them): up before the first PHY register access of any of the
+ * three users (USB2, USB3, DP) and down after the last one's exit. Downstream
+ * switches them with the cable; here dwc3's core exit in system suspend takes
+ * them down for every s2idle, ~150 mW.
+ */
+static int exynos9820_phy_supplies_on(struct exynos5_usbdrd_phy *phy_drd)
+{
+	int ret;
+
+	ret = regulator_bulk_enable(phy_drd->drv_data->n_regulators,
+				    phy_drd->regulators);
+	if (ret) {
+		dev_err(phy_drd->dev, "Failed to enable PHY regulator(s)\n");
+		return ret;
+	}
+	/* downstream waits 1 ms after switching the LDOs */
+	usleep_range(1000, 1100);
+	return 0;
+}
+
+static void exynos9820_phy_supplies_off(struct exynos5_usbdrd_phy *phy_drd)
+{
+	regulator_bulk_disable(phy_drd->drv_data->n_regulators,
+			       phy_drd->regulators);
+}
+
 /* phy_exynos_usbdp_g2_enable(), "2018.07.05 Power Optimization" .. PLL */
 static const struct exynos5_usbdrd_phy_tuning exynos9820_tunes_pipe3_preinit[] = {
 	/* TX JEQ even ctrl, LN0/LN2 (A0830/A1830), LN1/LN3 (1030/2030) */
@@ -2657,19 +2685,32 @@ static int exynos9820_usbdrd_phy_init(struct phy *phy)
 	struct exynos5_usbdrd_phy *phy_drd = to_usbdrd_phy(inst);
 	int ret;
 
-	if (inst->phy_cfg->id == EXYNOS5_DRDPHY_UTMI)
-		return exynos850_usbdrd_phy_init(phy);
+	if (inst->phy_cfg->id == EXYNOS5_DRDPHY_UTMI) {
+		ret = exynos9820_phy_supplies_on(phy_drd);
+		if (ret)
+			return ret;
+		ret = exynos850_usbdrd_phy_init(phy);
+		if (ret)
+			exynos9820_phy_supplies_off(phy_drd);
+		return ret;
+	}
 
 	if (!exynos9820_ss) {
 		dev_info(phy_drd->dev, "SS PHY disabled (exynos9820_ss=0)\n");
 		return 0;
 	}
 
+	ret = exynos9820_phy_supplies_on(phy_drd);
+	if (ret)
+		return ret;
+
 	/* reference clocks stay on while the PLL runs */
 	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_core_clks,
 				      phy_drd->core_clks);
-	if (ret)
+	if (ret) {
+		exynos9820_phy_supplies_off(phy_drd);
 		return ret;
+	}
 
 	/* PMA_REF_FREQ_SEL = 1 below assumes the 26 MHz downstream uses */
 	dev_info_once(phy_drd->dev, "SS PHY: ref %lu Hz, pma_ref %lu Hz\n",
@@ -2684,6 +2725,7 @@ static int exynos9820_usbdrd_phy_init(struct phy *phy)
 		exynos5_usbdrd_phy_isol(inst, true);
 		clk_bulk_disable_unprepare(phy_drd->drv_data->n_core_clks,
 					   phy_drd->core_clks);
+		exynos9820_phy_supplies_off(phy_drd);
 		return ret;
 	}
 
@@ -2703,8 +2745,12 @@ static int exynos9820_usbdrd_phy_exit(struct phy *phy)
 	struct exynos5_usbdrd_phy *phy_drd = to_usbdrd_phy(inst);
 	int ret;
 
-	if (inst->phy_cfg->id == EXYNOS5_DRDPHY_UTMI)
-		return exynos850_usbdrd_phy_exit(phy);
+	if (inst->phy_cfg->id == EXYNOS5_DRDPHY_UTMI) {
+		ret = exynos850_usbdrd_phy_exit(phy);
+		if (!ret)
+			exynos9820_phy_supplies_off(phy_drd);
+		return ret;
+	}
 
 	if (!phy_drd->ss_inited)
 		return 0;
@@ -2725,6 +2771,7 @@ static int exynos9820_usbdrd_phy_exit(struct phy *phy)
 		exynos5_usbdrd_phy_isol(inst, true);
 	clk_bulk_disable_unprepare(phy_drd->drv_data->n_core_clks,
 				   phy_drd->core_clks);
+	exynos9820_phy_supplies_off(phy_drd);
 
 	return 0;
 }
@@ -2947,10 +2994,16 @@ static int exynos9820_dp_phy_init(struct phy *phy)
 	struct phy_usb_instance *ss = &phy_drd->phys[EXYNOS5_DRDPHY_PIPE3];
 	int ret;
 
-	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_core_clks,
-				      phy_drd->core_clks);
+	ret = exynos9820_phy_supplies_on(phy_drd);
 	if (ret)
 		return ret;
+
+	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_core_clks,
+				      phy_drd->core_clks);
+	if (ret) {
+		exynos9820_phy_supplies_off(phy_drd);
+		return ret;
+	}
 	exynos5_usbdrd_phy_isol(ss, false);
 
 	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
@@ -2959,6 +3012,7 @@ static int exynos9820_dp_phy_init(struct phy *phy)
 			exynos5_usbdrd_phy_isol(ss, true);
 		clk_bulk_disable_unprepare(phy_drd->drv_data->n_core_clks,
 					   phy_drd->core_clks);
+		exynos9820_phy_supplies_off(phy_drd);
 		return ret;
 	}
 
@@ -2989,6 +3043,7 @@ static int exynos9820_dp_phy_exit(struct phy *phy)
 	}
 	clk_bulk_disable_unprepare(phy_drd->drv_data->n_core_clks,
 				   phy_drd->core_clks);
+	exynos9820_phy_supplies_off(phy_drd);
 	return 0;
 }
 
@@ -3131,6 +3186,11 @@ static const char * const exynos9820_core_clk_names[] = {
 	"ref", "pma_ref",
 };
 
+/* LDO10M 0.85 V, LDO11M 1.8 V, LDO12M 3.0 V; VBUS comes from the MAX77705 */
+static const char * const exynos9820_regulator_names[] = {
+	"dvdd", "vdd18", "vdd30",
+};
+
 static const struct exynos5_usbdrd_phy_drvdata exynos9820_usbdrd_phy = {
 	.phy_cfg			= phy_cfg_exynos9820,
 	.phy_ops			= &exynos9820_usbdrd_phy_ops,
@@ -3141,8 +3201,8 @@ static const struct exynos5_usbdrd_phy_drvdata exynos9820_usbdrd_phy = {
 	.n_clks				= ARRAY_SIZE(exynos9820_clk_names),
 	.core_clk_names			= exynos9820_core_clk_names,
 	.n_core_clks			= ARRAY_SIZE(exynos9820_core_clk_names),
-	.regulator_names		= exynos5_regulator_names,
-	.n_regulators			= ARRAY_SIZE(exynos5_regulator_names),
+	.regulator_names		= exynos9820_regulator_names,
+	.n_regulators			= ARRAY_SIZE(exynos9820_regulator_names),
 	.orien_sw_set			= exynos9820_usbdrd_orien_sw_set,
 	.dp_phy_ops			= &exynos9820_dp_phy_ops,
 };

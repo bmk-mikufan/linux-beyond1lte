@@ -271,6 +271,17 @@ static const struct s3c2410_wdt_variant drv_data_exynos850_cl1 = {
 		  QUIRK_HAS_PMU_RST_STAT | QUIRK_HAS_PMU_CNT_EN,
 };
 
+/* Exynos9820 CLUSTER0: as Exynos990, but the PMU has no counter-enable bit */
+static const struct s3c2410_wdt_variant drv_data_exynos9820_cl0 = {
+	.mask_reset_reg = EXYNOS850_CLUSTER0_NONCPU_INT_EN,
+	.mask_bit = 2,
+	.mask_reset_inv = true,
+	.rst_stat_reg = EXYNOS5_RST_STAT_REG_OFFSET,
+	.rst_stat_bit = EXYNOS850_CLUSTER0_WDTRESET_BIT,
+	.quirks = QUIRK_HAS_WTCLRINT_REG | QUIRK_HAS_PMU_MASK_RESET |
+		  QUIRK_HAS_PMU_RST_STAT,
+};
+
 static const struct s3c2410_wdt_variant drv_data_exynos990_cl0 = {
 	.mask_reset_reg = GS_CLUSTER0_NONCPU_INT_EN,
 	.mask_bit = 2,
@@ -388,6 +399,8 @@ static const struct of_device_id s3c2410_wdt_match[] = {
 	  .data = &drv_data_exynos7 },
 	{ .compatible = "samsung,exynos850-wdt",
 	  .data = &drv_data_exynos850_cl0 },
+	{ .compatible = "samsung,exynos9820-wdt",
+	  .data = &drv_data_exynos9820_cl0 },
 	{ .compatible = "samsung,exynos990-wdt",
 	  .data = &drv_data_exynos990_cl0 },
 	{ .compatible = "samsung,exynosautov9-wdt",
