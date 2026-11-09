@@ -1,0 +1,5 @@
+# Vulkan on the Mali-G76 (PanVK, Bifrost v7): experimental in Mesa, off by default.
+# To try it: sudo mv /etc/environment.d/60-s10-panvk.conf.off /etc/environment.d/60-s10-panvk.conf
+# then log out and in. Check with: vulkaninfo --summary
+# Mesa warns that Bifrost v7 Vulkan may be broken; the desktop itself stays on OpenGL ES.
+PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1

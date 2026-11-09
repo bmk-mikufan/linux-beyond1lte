@@ -59,7 +59,7 @@ apt-get install -y --no-install-recommends \
 	systemd-resolved systemd-timesyncd netplan.io network-manager wpasupplicant iw wireless-regdb \
 	openssh-server sudo bash-completion nano less vim-tiny iproute2 iputils-ping curl \
 	usbutils pciutils e2fsprogs htop tmux tzdata console-setup kbd \
-	v4l-utils ustreamer python3 python3-serial alsa-utils
+	v4l-utils ustreamer python3 python3-serial alsa-utils alsa-ucm-conf bluez
 case $DE in
 desktop)
 	# GNOME shows its on-screen keyboard for touch input by itself (forced on below)
@@ -69,13 +69,15 @@ desktop)
 		yaru-theme-gtk yaru-theme-icon yaru-theme-gnome-shell yaru-theme-sound \
 		fonts-noto-cjk fonts-noto-color-emoji ibus ibus-hangul language-pack-ko \
 		mesa-utils libgl1-mesa-dri mesa-vulkan-drivers dconf-cli xdg-user-dirs \
-		network-manager-gnome gnome-keyring
+		network-manager-gnome gnome-keyring \
+		pipewire-audio wireplumber iio-sensor-proxy vulkan-tools
 	;;
 lomiri)
 	apt-get install -y --no-install-recommends \
 		lomiri lomiri-desktop-session lomiri-system-settings lomiri-terminal-app \
 		maliit-keyboard gdm3 fonts-noto-cjk language-pack-ko \
-		libgl1-mesa-dri mesa-vulkan-drivers dconf-cli xdg-user-dirs
+		libgl1-mesa-dri mesa-vulkan-drivers dconf-cli xdg-user-dirs \
+		pipewire-audio wireplumber iio-sensor-proxy
 	;;
 esac
 apt-get clean
@@ -138,7 +140,8 @@ chroot "$R" depmod -a "$KREL"
 
 # port files (firmware from vendor, touch, GPU, USB KVM tuning)
 cp -a "$TOP/s10/rootfs/." "$R/"
-chroot "$R" systemctl enable s10-firstboot.service s10-touch-bind.service s10-gpu-load.service
+chroot "$R" systemctl enable s10-firstboot.service s10-touch-bind.service s10-gpu-load.service \
+	s10-bt-addr.service bluetooth.service
 
 umount "$R/dev" "$R/sys" "$R/proc"; trap - EXIT
 rm -f "$R/etc/resolv.conf"; ln -s /run/systemd/resolve/stub-resolv.conf "$R/etc/resolv.conf"

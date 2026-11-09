@@ -1,22 +1,26 @@
 #!/bin/sh
-# s10-firstboot: the Wi-Fi and Bluetooth firmware the image cannot carry, copied read-only
-# from this phone's own vendor partition (Odin flashing boot + userdata leaves vendor alone).
-# From mobian's s10e-firstboot, without the audio, modem and video parts (a server).
+# s10-firstboot: what the image cannot carry, copied read-only from this phone's own
+# partitions (Odin flashing boot + userdata leaves vendor and recovery alone):
+#  - vendor: Wi-Fi, Bluetooth, audio DSP (ABOX) and video codec (MFC) firmware
+#  - recovery: the sensor hub's RAM patch, which Samsung builds into its kernel
+# From mobian's s10e-firstboot, without the modem parts.
 # Drivers that probed before this ran found no firmware, so a boot that copied anything
 # reboots once. Runs every boot and does nothing once everything is in place.
 set -u
 FW=${FW:-/usr/lib/firmware}
 copied=0
 log() { echo "s10-firstboot: $*"; }
+part() { for n in "$@"; do [ -b /dev/disk/by-partlabel/$n ] && { echo /dev/disk/by-partlabel/$n; return; }; done; }
 
 V=/run/s10-vendor
 mkdir -p $V $FW/brcm
-if mount -t ext4 -o ro,noload /dev/disk/by-partlabel/vendor $V ||
-   mount -t ext4 -o ro,noload /dev/disk/by-partlabel/VENDOR $V; then
+VP=$(part vendor VENDOR)
+if [ -n "$VP" ] && mount -t ext4 -o ro,noload "$VP" $V; then
 	S=$V/firmware
 	cpf() {	# cpf SRC DST: one file, unless it is there already
 		[ -s "$FW/$2" ] && return 0
 		[ -s "$S/$1" ] || return 1
+		mkdir -p "$(dirname "$FW/$2")"
 		cp "$S/$1" "$FW/$2.part" && mv "$FW/$2.part" "$FW/$2" && copied=1 && log "$2 (vendor firmware/$1)"
 	}
 	# the S10's module may be Murata or Semco: take every BCM4375 Bluetooth patch and NVRAM there is
@@ -25,9 +29,15 @@ if mount -t ext4 -o ro,noload /dev/disk/by-partlabel/vendor $V ||
 	done
 	cpf bcmdhd_sta.bin_b1 brcm/brcmfmac4375b1-pcie.bin || log "vendor has no bcmdhd_sta.bin_b1: no Wi-Fi"
 	cpf bcmdhd_clm.blob brcm/brcmfmac4375b1-pcie.clm_blob
+	# ABOX (audio DSP) images, as mobian's list
+	for f in $(cd $S && ls *_AUDIO_SLSI.bin calliope*.bin calliope*.dt rxse.bin txse*.bin SoundBoosterParam.bin 2>/dev/null); do
+		cpf $f $f
+	done
+	# MFC: hardware H.264 / HEVC / VP9 decoding
+	cpf mfc_fw.bin s5p-mfc-v13.fw || log "vendor has no mfc_fw.bin: no hardware video decoding"
 	umount $V
 else
-	log "cannot mount the vendor partition: no Wi-Fi or Bluetooth firmware"
+	log "cannot mount the vendor partition: no Wi-Fi, Bluetooth, audio or video firmware"
 fi
 
 # the names the drivers ask for; Semco first, as on the S10e
@@ -38,6 +48,32 @@ done
 for h in bcm4375B1_semco.hcd $(cd $FW/brcm && ls bcm4375*.hcd 2>/dev/null); do
 	link $h BCM4362A2.hcd
 done
+
+# Sensor hub RAM patch: Samsung's kernel carries three, in the text format the driver reads.
+# A retail S10 (hw_rev 23, 25+) loads bbd_patch_file_beyond.h, the longest of them
+# (ssp_dev.c get_patch_version). The stock recovery kernel has the same three.
+SP=$FW/brcm/bcm4775-shub.patch
+RP=$(part recovery RECOVERY)
+if [ ! -s "$SP" ] && [ -n "$RP" ]; then
+	if python3 -I - "$RP" "$SP.part" <<'EOF'
+import re, sys
+d = open(sys.argv[1], 'rb').read()
+best = None
+for m in re.finditer(rb'<FormatVersion=[^\n]*\n<Crc=\d+>\n<BlobLength=(\d+)>\n<AsicVersion=0x004775B0>', d):
+    end = d.find(b'>\n', d.find(b'<Blob=', m.start())) + 2
+    if best is None or int(m.group(1)) > best[0]:
+        best = (int(m.group(1)), d[m.start():end])
+if not best:
+    sys.exit(1)
+open(sys.argv[2], 'wb').write(best[1])
+print(f'BlobLength {best[0]}')
+EOF
+	then
+		mv "$SP.part" "$SP" && copied=1 && log "brcm/bcm4775-shub.patch (recovery kernel)"
+	else
+		rm -f "$SP.part"; log "no sensor hub patch in the recovery partition: no sensors"
+	fi
+fi
 
 if [ $copied = 1 ]; then
 	log "rebooting once, so the drivers load what was copied"

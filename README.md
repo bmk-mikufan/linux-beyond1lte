@@ -39,8 +39,13 @@ userdata 이미지는 셋 중 **하나만** 고르면 됩니다. 모두 ssh, Net
 | **DP alt mode** (USB-C → HDMI) | 켜짐, 2레인 | 1080p60, USB 3와 동시 사용 |
 | PD 충전 | 최대 9V / 15W | PPS·PR_Swap 차단 |
 | Wi-Fi | BCM4375 | 펌웨어는 첫 부팅 때 폰의 vendor 파티션에서 복사 |
+| 블루투스 | BCM4375 (UART), bluez | 주소는 efs의 `bt_addr`, 펌웨어는 vendor에서 |
+| 스피커·마이크 | CS47L93 + CS35L40 ×2, ABOX | S10e 사운드 카드 그대로 (순정 오버레이와 배선 동일), DSP 펌웨어는 vendor에서 |
+| 센서 (회전, 밝기, 근접, 나침반) | BCM4775 센서 허브 | RAM 패치는 첫 부팅 때 폰의 recovery 커널에서 추출 |
+| 하드웨어 동영상 디코딩 | MFC: H.264 / HEVC / VP9 | 펌웨어 `mfc_fw.bin`은 vendor에서 |
+| Vulkan | PanVK, 실험적, 기본 꺼짐 | 아래 GPU 항목 참고 |
 | 시스템 절전 | 꺼 둠 | KVM은 항상 깨어 있어야 함 |
-| LTE·통화·오디오·카메라 | 범위 밖 | |
+| LTE·통화·카메라·GPS·NFC·지문 | 범위 밖 / 불가 | 지문은 보안 영역에 잠김 |
 
 ## GPU 가속
 
@@ -54,6 +59,22 @@ userdata 이미지는 셋 중 **하나만** 고르면 됩니다. 모두 ssh, Net
   로그인할 때 `s10: GPU (panfrost) not up` 경고가 뜹니다. butztill이 S10에서 조건 없이 panfrost를 올렸을 때
   동작했으니, S10의 S-Boot는 G3D를 켜 둔 채로 넘겨주는 것으로 보입니다.
 - 확인: `ls /dev/dri/renderD128`, `glxinfo -B | grep renderer` (Mali-G76이어야 함), `journalctl -u s10-gpu-load`.
+- **Vulkan**: Mesa는 Bifrost v7(G76)의 PanVK를 아직 실험 단계로 두고, `PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1` 없이는
+  올리지 않습니다(Mesa 25.2의 Vulkan 1.4는 Valhall v10 이상만). 써 보려면
+  `sudo mv /etc/environment.d/60-s10-panvk.conf.off /etc/environment.d/60-s10-panvk.conf` 후 다시 로그인,
+  `vulkaninfo --summary`로 확인. 데스크톱 자체는 OpenGL ES 3.1로 그대로 GPU 가속됩니다.
+
+## 첫 부팅 때 폰에서 복사하는 것
+
+이미지는 삼성 펌웨어를 담지 않습니다. `s10-firstboot.service`가 첫 부팅 때 폰의 파티션에서 **읽기 전용으로** 가져오고 한 번 재부팅합니다.
+
+| 출처 | 가져오는 것 |
+|---|---|
+| `vendor` | Wi-Fi(`bcmdhd_sta.bin_b1`, `bcmdhd_clm.blob`, NVRAM), 블루투스(`bcm4375*.hcd`), ABOX 오디오(`calliope*`, `*_AUDIO_SLSI.bin`, `rxse`/`txse`, `SoundBoosterParam.bin`), MFC(`mfc_fw.bin`) |
+| `recovery` (순정 커널) | 센서 허브 RAM 패치. 삼성 커널에 들어 있는 3개 중 소매판 S10용(`bbd_patch_file_beyond.h`, 가장 긴 것)을 골라 `brcm/bcm4775-shub.patch`로 저장 |
+| `efs` | 블루투스 주소(`bluetooth/bt_addr`) |
+
+그래서 **recovery 파티션은 순정을 유지하세요**(TWRP 등으로 바꾸면 센서 패치를 못 찾습니다. 이미 복사된 뒤면 상관없음).
 
 ## USB 허브 + PD 패스스루 조건
 
@@ -87,6 +108,10 @@ SamMobile 기준 MD5(`423dcc6bc787704e814d7ff9d4a3235e`)와 일치하는 SKT 순
 | 패널 S6E3HA9 "beyond1 A3 S0" | 순정 커널에 `s6e3ha9`, `beyond1_a3_s0` 다수 | ✅ |
 | 패널 WQHD+ 명령 (scaler `ba 01 26 08 08 f3`, CASET 0x59f, PASET 0xbdf, AOR 표) | 순정 커널 표와 같음 | ✅ |
 | 메모리 예약 영역 | S-Boot DT의 고정 영역(디버그 로그 15곳, sec_rdx 등)을 모두 덮음 | ✅ |
+| 오디오 배선 (CS47L93 spi_2, CS35L40 ×2 hsi2c_38, 리셋·IRQ GPIO, 부스트) | 보드 오버레이(hw_rev 0x1a 이상)가 S10e와 동일 | ✅ |
+| 센서 허브 배선 (spi17 25MHz, host-req gpa1-7, mcu-req/resp gpg4-1/2, int gpa4-0, pwr-en gpg0-2) | 동일 | ✅ |
+| 센서 허브 패치 (BCM4775 B0) | 순정 커널·recovery에 3개, 소매판은 `beyond`(BlobLength 445267) | ✅ 추출 스크립트로 확인 |
+| 오디오 DSP·MFC 펌웨어 파일 | vendor에 모두 있음 | ✅ |
 
 Wi-Fi가 안 되면 NVRAM이 다른 모듈용일 수 있습니다:
 `sudo ln -sf nvram.txt_1rh_es43_b1 /usr/lib/firmware/brcm/brcmfmac4375b1-pcie.txt` 후 재부팅.

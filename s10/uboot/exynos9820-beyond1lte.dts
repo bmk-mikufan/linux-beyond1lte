@@ -7,7 +7,8 @@
  * board as the S10 (touch, PMIC rails, buttons, MAX77705, USB-C) with a
  * smaller panel and battery. Changed here: model, the 1440x3040 S-Boot
  * framebuffer, the battery, and the S6E3HA9 panel instead of the S10e's
- * S6E3FA7. Audio is off (server).
+ * S6E3FA7. Audio and the sensor hub are the S10e's: the SM-G973N stock
+ * board overlay wires them the same.
  * Not yet booted on an S10: see README.md.
  */
 
@@ -1162,8 +1163,14 @@
 
 / {
 	sound {
+		/*
+		 * The S10e's card as is: the SM-G973N stock overlay (BEYOND1LTE KOR,
+		 * hw_rev 0x1a+) has the same CS47L93 on spi_2 (reset gpg1-0, IRQ
+		 * gpa2-2, same dmic-ref/inmode/out-mono) and the same CS35L40 pair on
+		 * hsi2c_38 (0x40 reset gph1-1, 0x41 reset gph1-2, IRQ gpm24-0,
+		 * 4100 mA boost peak, sdout hi-z 3).
+		 */
 		compatible = "samsung,beyond0lte-madera";
-		status = "disabled";	/* server: no audio; S10 amps unverified */
 		pinctrl-names = "default";
 		pinctrl-0 = <&codec_aif1>;
 		samsung,audio-codec = <&codec>;
