@@ -65,7 +65,8 @@ chmod 600 "$R/etc/netplan/01-s10.yaml"
 echo 'LABEL=s10root / ext4 defaults,noatime,x-systemd.growfs 0 1' > "$R/etc/fstab"
 
 # kernel and modules
-tar -C "$R" -xzf "$KTAR"
+# --keep-directory-symlink: the tarball has lib/, the rootfs a /lib -> usr/lib link (usrmerge)
+tar -C "$R" --keep-directory-symlink -xzf "$KTAR"
 KREL=$(ls "$R/lib/modules" | head -1)
 chroot "$R" depmod -a "$KREL"
 
