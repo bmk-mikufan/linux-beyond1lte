@@ -1,0 +1,59 @@
+# Galaxy S10 (beyond1lte) Odin images: U-Boot (boot) and Ubuntu Server (userdata).
+# The kernel is built locally (s10/build-kernel.sh) and attached to a release first;
+# this workflow takes s10-kernel-*.tar.gz from that release and adds the Odin files to it.
+name: s10-images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag that carries s10-kernel-*.tar.gz"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  images:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      OUT: ${{ github.workspace }}/out-s10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            s10
+            mobian/uboot
+          fetch-depth: 1
+
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap mkbootimg android-sdk-libsparse-utils e2fsprogs xz-utils \
+            build-essential bc bison flex device-tree-compiler libssl-dev libgnutls28-dev \
+            uuid-dev swig python3-dev python3-setuptools python3-pyelftools python3-libfdt
+
+      - name: Kernel from the release
+        run: |
+          mkdir -p "$OUT"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p 's10-kernel-*.tar.gz' -D "$OUT"
+          ls -l "$OUT"
+
+      - name: U-Boot -> boot.img
+        run: sh s10/build-uboot.sh
+
+      - name: Ubuntu Server -> userdata.img
+        run: sudo -E sh s10/build-rootfs.sh "$(ls "$OUT"/s10-kernel-*.tar.gz)"
+
+      - name: Upload to the release
+        run: |
+          cd "$OUT"
+          sudo chown "$(id -u)" s10-ubuntu-userdata.tar.md5
+          xz -T0 -6 s10-ubuntu-userdata.tar.md5
+          sha256sum s10-uboot-boot.tar.md5 s10-ubuntu-userdata.tar.md5.xz u-boot-s10.bin exynos9820-beyond1lte.dtb > SHA256SUMS-images
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
+            s10-uboot-boot.tar.md5 s10-ubuntu-userdata.tar.md5.xz u-boot-s10.bin exynos9820-beyond1lte.dtb SHA256SUMS-images

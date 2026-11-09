@@ -1,0 +1,14 @@
+[Unit]
+Description=S10: Wi-Fi and Bluetooth firmware from the vendor partition
+DefaultDependencies=no
+After=local-fs.target
+Before=NetworkManager.service bluetooth.service sysinit.target
+ConditionPathExists=!/etc/s10/no-firstboot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s10-firstboot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

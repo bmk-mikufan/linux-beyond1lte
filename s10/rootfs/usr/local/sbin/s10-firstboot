@@ -1,0 +1,47 @@
+#!/bin/sh
+# s10-firstboot: the Wi-Fi and Bluetooth firmware the image cannot carry, copied read-only
+# from this phone's own vendor partition (Odin flashing boot + userdata leaves vendor alone).
+# From mobian's s10e-firstboot, without the audio, modem and video parts (a server).
+# Drivers that probed before this ran found no firmware, so a boot that copied anything
+# reboots once. Runs every boot and does nothing once everything is in place.
+set -u
+FW=${FW:-/usr/lib/firmware}
+copied=0
+log() { echo "s10-firstboot: $*"; }
+
+V=/run/s10-vendor
+mkdir -p $V $FW/brcm
+if mount -t ext4 -o ro,noload /dev/disk/by-partlabel/vendor $V ||
+   mount -t ext4 -o ro,noload /dev/disk/by-partlabel/VENDOR $V; then
+	S=$V/firmware
+	cpf() {	# cpf SRC DST: one file, unless it is there already
+		[ -s "$FW/$2" ] && return 0
+		[ -s "$S/$1" ] || return 1
+		cp "$S/$1" "$FW/$2.part" && mv "$FW/$2.part" "$FW/$2" && copied=1 && log "$2 (vendor firmware/$1)"
+	}
+	# the S10's module may be Murata or Semco: take every BCM4375 Bluetooth patch and NVRAM there is
+	for f in $(cd $S && ls bcm4375*.hcd nvram.txt* 2>/dev/null); do
+		cpf $f brcm/$f
+	done
+	cpf bcmdhd_sta.bin_b1 brcm/brcmfmac4375b1-pcie.bin || log "vendor has no bcmdhd_sta.bin_b1: no Wi-Fi"
+	cpf bcmdhd_clm.blob brcm/brcmfmac4375b1-pcie.clm_blob
+	umount $V
+else
+	log "cannot mount the vendor partition: no Wi-Fi or Bluetooth firmware"
+fi
+
+# the names the drivers ask for; Semco first, as on the S10e
+link() { [ -e "$FW/brcm/$2" ] || { [ -s "$FW/brcm/$1" ] && ln -s "$1" "$FW/brcm/$2" && log "$2 -> $1"; }; }
+for n in nvram.txt_CS01_semco_b1 $(cd $FW/brcm && ls nvram.txt* 2>/dev/null); do
+	link $n brcmfmac4375b1-pcie.txt
+done
+for h in bcm4375B1_semco.hcd $(cd $FW/brcm && ls bcm4375*.hcd 2>/dev/null); do
+	link $h BCM4362A2.hcd
+done
+
+if [ $copied = 1 ]; then
+	log "rebooting once, so the drivers load what was copied"
+	sync
+	[ -n "${NOREBOOT:-}" ] || systemctl --no-block reboot
+fi
+exit 0

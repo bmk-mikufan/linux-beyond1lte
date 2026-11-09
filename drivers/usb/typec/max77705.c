@@ -721,21 +721,34 @@ static int max77705_usbc_dr_set(struct typec_port *port, enum typec_data_role ro
 	return max77705_usbc_dr_swap(u);
 }
 
+/*
+ * A powered hub with PD pass-through is the PD source and, as a source,
+ * starts as the DFP. Many hubs then never ask for DR_Swap, so the phone
+ * charges but sees nothing behind the hub. With pd_host the phone asks for
+ * the host role itself once a sink contract is up (Android does the same
+ * for docks). Off, only a DisplayPort dock is asked.
+ */
+static bool pd_host = true;
+module_param(pd_host, bool, 0644);
+MODULE_PARM_DESC(pd_host, "As a PD sink in the device role, ask the source for the host role (powered hubs)");
+
 static void max77705_usbc_dr_swap_work(struct work_struct *work)
 {
 	struct max77705_usbc *u = container_of(to_delayed_work(work),
 					       struct max77705_usbc, dr_swap_work);
 
 	guard(mutex)(&u->lock);
-	if (u->data_role != TYPEC_DEVICE || !u->dp_configured || !u->pd_contract)
+	if (u->data_role != TYPEC_DEVICE || !u->pd_contract ||
+	    (!u->dp_configured && !pd_host))
 		return;
 	/* the firmware drops a request while it is busy (a PD renegotiation): retry */
 	if (u->dr_swap_tries >= 5) {
-		dev_warn(u->dev, "DisplayPort dock kept the host role\n");
+		dev_warn(u->dev, "PD partner kept the host role\n");
 		return;
 	}
 	u->dr_swap_tries++;
-	dev_info(u->dev, "DisplayPort dock: asking for the host role (%u)\n", u->dr_swap_tries);
+	dev_info(u->dev, "%s: asking for the host role (%u)\n",
+		 u->dp_configured ? "DisplayPort dock" : "PD source", u->dr_swap_tries);
 	if (max77705_usbc_dr_swap(u))
 		dev_warn(u->dev, "DR_Swap request failed\n");
 	queue_delayed_work(u->wq, &u->dr_swap_work, msecs_to_jiffies(3000));
@@ -1428,6 +1441,9 @@ static void max77705_usbc_pd_ready(struct max77705_usbc *u)
 		u->pd_contract = true;
 		typec_set_pwr_opmode(u->port, TYPEC_PWR_MODE_PD);
 		max77705_usbc_register_partner(u, TYPEC_ACCESSORY_NONE);
+		/* after the contract settles; the firmware drops a swap asked mid-negotiation */
+		if (pd_host && u->data_role == TYPEC_DEVICE && !u->dr_swap_tries)
+			queue_delayed_work(u->wq, &u->dr_swap_work, msecs_to_jiffies(1500));
 	}
 
 	if (pdo_type(pdo) == PDO_TYPE_FIXED) {
