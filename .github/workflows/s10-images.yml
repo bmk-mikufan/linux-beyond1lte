@@ -52,7 +52,7 @@ jobs:
       - name: Upload to the release
         run: |
           cd "$OUT"
-          sudo chown "$(id -u)" s10-ubuntu-userdata.tar.md5
+          sudo chown "$(id -u):$(id -g)" s10-ubuntu-userdata.tar.md5
           xz -T0 -6 s10-ubuntu-userdata.tar.md5
           sha256sum s10-uboot-boot.tar.md5 s10-ubuntu-userdata.tar.md5.xz u-boot-s10.bin exynos9820-beyond1lte.dtb > SHA256SUMS-images
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
