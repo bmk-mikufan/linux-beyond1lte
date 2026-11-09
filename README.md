@@ -33,7 +33,7 @@ userdata 이미지는 셋 중 **하나만** 고르면 됩니다. 모두 ssh, Net
 | 부팅 (S-Boot → U-Boot → 리눅스) | 미검증 | 같은 방식이 S10+에서 동작 |
 | 화면 | DECON KMS + S6E3HA9 패널 드라이버 | 밝기, 화면 끄기/켜기(번인 방지) |
 | 터치 | S6SY761 | S10e와 같은 칩·버스 |
-| GPU | panfrost (Mali-G76) | G3D 전원 도메인이 켜져 있을 때만 로드, 아니면 소프트웨어 렌더링 |
+| GPU 가속 | panfrost (Mali-G76 MP12), 기본 켜짐 | GNOME/Mir → Mesa kmsro(`exynos`) → panfrost, 아래 참고 |
 | USB 호스트 + 허브 | ✅ 코드상 | 9820 dwc3 허브 버그(GFLADJ) 수정 포함 |
 | **USB 3** | 켜짐 | S10e에서 독으로 검증된 경로 |
 | **DP alt mode** (USB-C → HDMI) | 켜짐, 2레인 | 1080p60, USB 3와 동시 사용 |
@@ -41,6 +41,19 @@ userdata 이미지는 셋 중 **하나만** 고르면 됩니다. 모두 ssh, Net
 | Wi-Fi | BCM4375 | 펌웨어는 첫 부팅 때 폰의 vendor 파티션에서 복사 |
 | 시스템 절전 | 꺼 둠 | KVM은 항상 깨어 있어야 함 |
 | LTE·통화·오디오·카메라 | 범위 밖 | |
+
+## GPU 가속
+
+화면은 DECON KMS(DRM 드라이버 이름 `exynos`)가 맡고, Ubuntu noble의 Mesa 25.2(`exynos_dri.so` = kmsro)가
+**panfrost(Mali-G76)로 렌더링해서 바로 스캔아웃 버퍼에 씁니다**. pulpoff 커널의 panfrost에는 9820 전용 설정
+(비-코히런트, DVFS 156–702 MHz)이 있고, S10e(pulpoff)와 S10(butztill) 모두에서 panfrost 가속이 동작했습니다.
+
+- `s10-gpu-load.service`가 GDM보다 먼저 DECON KMS와 panfrost를 올립니다.
+- 단 하나의 예외: S-Boot가 G3D 전원 도메인을 **꺼 둔 채** 넘겨주면 메인라인은 그걸 안전하게 켤 수 없어서
+  (TZPC 복원 없음, 켜지 않고 GPU 레지스터를 건드리면 SoC가 멈춤) panfrost를 올리지 않습니다. 그때만 llvmpipe가 쓰이고,
+  로그인할 때 `s10: GPU (panfrost) not up` 경고가 뜹니다. butztill이 S10에서 조건 없이 panfrost를 올렸을 때
+  동작했으니, S10의 S-Boot는 G3D를 켜 둔 채로 넘겨주는 것으로 보입니다.
+- 확인: `ls /dev/dri/renderD128`, `glxinfo -B | grep renderer` (Mali-G76이어야 함), `journalctl -u s10-gpu-load`.
 
 ## USB 허브 + PD 패스스루 조건
 
