@@ -1,0 +1,37 @@
+#!/bin/sh
+# s10-charge-limit: keep the battery between START and STOP percent while the phone runs
+# from external power (a NAS or KVM is plugged in for good; a Li-ion kept at 100 % and warm
+# ages and swells). Above STOP the charger's charge_behaviour goes to inhibit-charge: the
+# MAX77705 keeps running the phone from USB and only stops charging the battery. At or
+# below START it goes back to auto. Settings: /etc/s10/charge-limit.conf
+CONF=${CONF:-/etc/s10/charge-limit.conf}
+PS=${PS:-/sys/class/power_supply}
+ENABLED=1; STOP=80; START=75; INTERVAL=60
+log() { echo "s10-charge-limit: $*"; }
+
+chg=; bat=
+for d in "$PS"/*; do
+	[ -w "$d/charge_behaviour" ] && [ -z "$chg" ] && chg=$d
+	[ "$(cat "$d/type" 2>/dev/null)" = Battery ] && [ -r "$d/capacity" ] && [ -z "$bat" ] && bat=$d
+done
+[ -n "$chg" ] && [ -n "$bat" ] || { log "no charger with charge_behaviour or no battery"; exit 0; }
+
+set_mode() {
+	cur=$(sed -n 's/.*\[\([a-z-]*\)\].*/\1/p' "$chg/charge_behaviour")
+	[ "$cur" = "$1" ] && return
+	echo "$1" > "$chg/charge_behaviour" && log "$2: $1"
+}
+trap 'set_mode auto "stopping"; exit 0' TERM INT
+
+while :; do
+	[ -r "$CONF" ] && . "$CONF"
+	cap=$(cat "$bat/capacity" 2>/dev/null) || cap=
+	if [ "$ENABLED" != 1 ] || [ -z "$cap" ]; then
+		set_mode auto "limit off"
+	elif [ "$cap" -ge "$STOP" ]; then
+		set_mode inhibit-charge "battery $cap% >= $STOP%"
+	elif [ "$cap" -le "$START" ]; then
+		set_mode auto "battery $cap% <= $START%"
+	fi
+	sleep "$INTERVAL" & wait $!
+done

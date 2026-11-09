@@ -38,6 +38,7 @@ userdata 이미지는 셋 중 **하나만** 고르면 됩니다. 모두 ssh, Net
 | **USB 3** | 켜짐 | S10e에서 독으로 검증된 경로 |
 | **DP alt mode** (USB-C → HDMI) | 켜짐, 2레인 | 1080p60, USB 3와 동시 사용 |
 | PD 충전 | 최대 9V / 15W | PPS·PR_Swap 차단 |
+| **충전 상한** | 기본 75–80% | 배터리 부풀음 방지, 아래 참고 |
 | Wi-Fi | BCM4375 | 펌웨어는 첫 부팅 때 폰의 vendor 파티션에서 복사 |
 | 블루투스 | BCM4375 (UART), bluez | 주소는 efs의 `bt_addr`, 펌웨어는 vendor에서 |
 | 스피커·마이크 | CS47L93 + CS35L40 ×2, ABOX | S10e 사운드 카드 그대로 (순정 오버레이와 배선 동일), DSP 펌웨어는 vendor에서 |
@@ -75,6 +76,26 @@ userdata 이미지는 셋 중 **하나만** 고르면 됩니다. 모두 ssh, Net
 | `efs` | 블루투스 주소(`bluetooth/bt_addr`) |
 
 그래서 **recovery 파티션은 순정을 유지하세요**(TWRP 등으로 바꾸면 센서 패치를 못 찾습니다. 이미 복사된 뒤면 상관없음).
+
+## 충전 상한 (24시간 연결용)
+
+NAS·KVM처럼 늘 충전기에 꽂아 두면 100% 상태로 따뜻하게 유지되어 배터리가 늙고 부풀 수 있습니다.
+그래서 **기본으로 80%에서 충전을 멈추고 75%에서 다시 충전**합니다.
+
+- 충전을 멈춰도 폰은 USB 전원으로 계속 동작합니다. 충전 칩(MAX77705)의 CHG_EN만 끄고 buck은 켜 둔 상태이고,
+  삼성 순정의 "배터리 보호" 모드와 같은 방식입니다.
+- 커널: 충전기에 표준 속성 `charge_behaviour`(`auto` / `inhibit-charge`)를 추가했고, 배터리 상태는 그동안
+  `Not charging`으로 보입니다.
+- `s10-charge-limit.service`가 60초마다 잔량을 보고 전환합니다.
+- 설정: `/etc/s10/charge-limit.conf` (`STOP=80`, `START=75`, `ENABLED=0`이면 100%까지). 재시작 없이 다음 확인 때 반영.
+- 확인: `cat /sys/class/power_supply/max77705-charger/charge_behaviour`, `journalctl -u s10-charge-limit`.
+
+## 저장공간
+
+- Ubuntu는 userdata 파티션 전체를 씁니다(512GB 모델 약 468 GiB). 첫 부팅 때 파일시스템이 자동으로 끝까지 늘어납니다.
+- ext4의 root 전용 예약은 기본 5% 대신 **1%**(약 4.7 GB)로 만들어서, 일반 사용자가 쓸 수 있는 공간이 약 18 GB 늘어납니다.
+- UFS 2.1이 메인라인에서도 최고 속도(HS-G3)로 붙습니다. 삼성 발표치로 이 512GB eUFS 2.1은 순차 쓰기 약 255 MB/s라
+  기가비트 LAN(약 110 MB/s)보다 빠릅니다. NAS로 쓸 때 병목은 네트워크입니다.
 
 ## USB 허브 + PD 패스스루 조건
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=S10: charge limit (battery kept between START and STOP percent)
+After=systemd-udevd.service
+
+[Service]
+ExecStart=/usr/local/sbin/s10-charge-limit
+# back to normal charging when stopped
+ExecStopPost=/bin/sh -c 'for f in /sys/class/power_supply/*/charge_behaviour; do [ -w "$f" ] && echo auto > "$f"; done; true'
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

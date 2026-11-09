@@ -149,6 +149,18 @@ static int max17042_get_status(struct max17042_chip *chip, int *status)
 		return 0;
 	}
 
+	/* the charger was told not to charge (a charge limit): supplied, not charging */
+	{
+		union power_supply_propval cb;
+
+		if (!power_supply_get_property_from_supplier(chip->battery,
+				POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR, &cb) &&
+		    cb.intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE) {
+			*status = POWER_SUPPLY_STATUS_NOT_CHARGING;
+			return 0;
+		}
+	}
+
 	/*
 	 * The MAX170xx has builtin end-of-charge detection and will update
 	 * FullCAP to match RepCap when it detects end of charging.

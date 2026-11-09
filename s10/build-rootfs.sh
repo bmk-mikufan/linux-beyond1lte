@@ -141,14 +141,15 @@ chroot "$R" depmod -a "$KREL"
 # port files (firmware from vendor, touch, GPU, USB KVM tuning)
 cp -a "$TOP/s10/rootfs/." "$R/"
 chroot "$R" systemctl enable s10-firstboot.service s10-touch-bind.service s10-gpu-load.service \
-	s10-bt-addr.service bluetooth.service
+	s10-bt-addr.service bluetooth.service s10-charge-limit.service
 
 umount "$R/dev" "$R/sys" "$R/proc"; trap - EXIT
 rm -f "$R/etc/resolv.conf"; ln -s /run/systemd/resolve/stub-resolv.conf "$R/etc/resolv.conf"
 
-# ext4 that U-Boot reads: no orphan_file / csum_seed (newer than its ext4 reader)
+# ext4 that U-Boot reads: no orphan_file / csum_seed (newer than its ext4 reader);
+# -m 1: 1 % for root instead of 5 % (about 4.7 GB of a 512 GB userdata, not 23 GB)
 rm -f "$OUT/rootfs.ext4"
-mkfs.ext4 -q -L s10root -O ^orphan_file,^metadata_csum_seed -d "$R" "$OUT/rootfs.ext4" "$SIZE"
+mkfs.ext4 -q -L s10root -m 1 -O ^orphan_file,^metadata_csum_seed -d "$R" "$OUT/rootfs.ext4" "$SIZE"
 img2simg "$OUT/rootfs.ext4" "$OUT/userdata.img" 4096
 rm -f "$OUT/rootfs.ext4"
 

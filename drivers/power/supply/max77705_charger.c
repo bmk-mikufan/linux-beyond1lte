@@ -39,6 +39,7 @@ static enum power_supply_property max77705_charger_props[] = {
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 };
 
 /*
@@ -262,7 +263,7 @@ static int max77705_get_status(struct max77705_charger_data *chg, int *val)
 
 	regmap_field_read(chg->rfield[MAX77705_CHG_EN], &chg_en);
 	if (!chg_en) {
-		*val = POWER_SUPPLY_CHARGE_TYPE_NONE;
+		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
 		return 0;
 	}
 
@@ -499,6 +500,16 @@ static int max77705_chg_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
 		val->intval = chg->bat_info->voltage_max_design_uv;
 		break;
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR: {
+		unsigned int chg_en;
+		int err = regmap_field_read(chg->rfield[MAX77705_CHG_EN], &chg_en);
+
+		if (err)
+			return err;
+		val->intval = chg_en ? POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
+				       POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
+		break;
+	}
 	case POWER_SUPPLY_PROP_MODEL_NAME:
 		val->strval = max77705_charger_model;
 		break;
@@ -529,6 +540,27 @@ static int max77705_set_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 		err = max77705_set_input_current(chg, val->intval);
 		break;
+	/*
+	 * inhibit-charge clears CHG_EN (CNFG_09) only: the buck keeps running
+	 * the phone from CHGIN and the battery just stops charging, as stock's
+	 * charging-off state does (battery protection, store mode). A charge
+	 * limit is this plus a capacity check in userspace (s10-charge-limit).
+	 */
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		switch (val->intval) {
+		case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
+			err = regmap_field_write(chg->rfield[MAX77705_CHG_EN], 1);
+			break;
+		case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
+			err = regmap_field_write(chg->rfield[MAX77705_CHG_EN],
+						 MAX77705_CHG_DISABLE);
+			break;
+		default:
+			return -EINVAL;
+		}
+		if (!err)
+			power_supply_changed(psy);
+		break;
 	default:
 		err = -EINVAL;
 	}
@@ -542,6 +574,7 @@ static int max77705_property_is_writeable(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 		return true;
 	default:
 		return false;
@@ -554,6 +587,8 @@ static const struct power_supply_desc max77705_charger_psy_desc = {
 	.properties = max77705_charger_props,
 	.property_is_writeable = max77705_property_is_writeable,
 	.num_properties = ARRAY_SIZE(max77705_charger_props),
+	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
 	.get_property = max77705_chg_get_property,
 	.set_property = max77705_set_property,
 };
