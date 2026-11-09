@@ -92,9 +92,6 @@
 #define DSIM_EMPTY_PH_SFR		BIT(10)
 #define DSIM_FULL_PL_SFR		BIT(9)
 
-#define S10E_WIDTH			1080
-#define S10E_HEIGHT			2280
-#define S10E_SIZE_REG			((S10E_HEIGHT << 16) | S10E_WIDTH)
 
 struct decon_kms {
 	struct drm_device drm;
@@ -133,6 +130,8 @@ struct decon_kms {
 	u32 boot_base;
 	u32 boot_in_con;
 	u32 boot_src_size;
+	/* the panel size S-Boot programmed: 1080x2280 (S10e), 1440x3040 (S10) */
+	u32 width, height;
 };
 
 static bool psr = true;
@@ -207,6 +206,7 @@ static int decon_pipe_check(struct drm_simple_display_pipe *pipe,
 			    struct drm_plane_state *plane_state,
 			    struct drm_crtc_state *crtc_state)
 {
+	struct decon_kms *dk = to_decon(pipe->crtc.dev);
 	struct drm_framebuffer *fb = plane_state->fb;
 	int ret;
 
@@ -219,7 +219,7 @@ static int decon_pipe_check(struct drm_simple_display_pipe *pipe,
 
 	/* full-screen, unpanned, stride a whole number of pixels */
 	if (plane_state->src.x1 || plane_state->src.y1 ||
-	    fb->width < S10E_WIDTH || fb->height < S10E_HEIGHT ||
+	    fb->width < dk->width || fb->height < dk->height ||
 	    fb->pitches[0] % 4 || fb->pitches[0] / 4 > 0xffff)
 		return -EINVAL;
 
@@ -244,7 +244,7 @@ static void decon_pipe_update(struct drm_simple_display_pipe *pipe,
 		decon_scanout(dk, lower_32_bits(addr),
 			      (dk->boot_in_con & ~IDMA_IMG_FORMAT) |
 			      FIELD_PREP(IDMA_IMG_FORMAT, fmt),
-			      (S10E_HEIGHT << 16) | (fb->pitches[0] / 4));
+			      (dk->height << 16) | (fb->pitches[0] / 4));
 	}
 	/* a damage-only commit (DirtyFB, fbdev) changes pixels in place */
 	decon_trig_kick(dk, 2);
@@ -290,7 +290,7 @@ static void decon_pipe_disable(struct drm_simple_display_pipe *pipe)
 	 * The panel cannot be switched off yet (no DSI driver), so "off" is
 	 * black, which on OLED is pixels off.
 	 */
-	memset(dk->boot_fb, 0, S10E_WIDTH * S10E_HEIGHT * 4);
+	memset(dk->boot_fb, 0, dk->width * dk->height * 4);
 	wmb();
 	decon_scanout(dk, dk->boot_base, dk->boot_in_con, dk->boot_src_size);
 	decon_trig_kick(dk, 2);
@@ -824,6 +824,7 @@ static int decon_check_handover(struct decon_kms *dk)
 	u32 path0 = readl(dk->decon + DECON_DATA_PATH_CONTROL_0);
 	u32 path1 = readl(dk->decon + DECON_DATA_PATH_CONTROL_1);
 	unsigned int w, nwin = 0;
+	u32 size;
 
 	if ((ctrl & DECON_GLOBAL_RUN) != DECON_GLOBAL_RUN ||
 	    (trig & (DECON_HW_TRIG_EN | DECON_HW_TRIG_MASK_DECON)) !=
@@ -848,16 +849,21 @@ static int decon_check_handover(struct decon_kms *dk)
 	dk->boot_in_con = readl(dk->idma + IDMA_IN_CON);
 	dk->boot_src_size = readl(dk->idma + IDMA_SRC_SIZE);
 	dk->boot_base = readl(dk->idma + IDMA_IN_BASE_ADDR_Y);
-	if (readl(dk->decon + DECON_BLENDER_BG_IMAGE_SIZE_0) != S10E_SIZE_REG ||
-	    readl(dk->idma + IDMA_IMG_SIZE) != S10E_SIZE_REG ||
+	/* (height << 16) | width, as S-Boot set it up for the panel it lit */
+	size = readl(dk->decon + DECON_BLENDER_BG_IMAGE_SIZE_0);
+	dk->width = size & 0xffff;
+	dk->height = size >> 16;
+	if (readl(dk->idma + IDMA_IMG_SIZE) != size ||
+	    dk->width < 640 || dk->width > 4096 ||
+	    dk->height < 480 || dk->height > 4096 ||
 	    FIELD_GET(IDMA_IMG_FORMAT, dk->boot_in_con) != IDMA_FMT_ARGB8888) {
-		dev_err(dev, "unexpected boot scanout (IN_CON 0x%08x)\n",
-			dk->boot_in_con);
+		dev_err(dev, "unexpected boot scanout (size 0x%08x, IN_CON 0x%08x)\n",
+			size, dk->boot_in_con);
 		return -ENODEV;
 	}
 
-	dev_info(dev, "taking over window %u, GF0 at 0x%08x\n", dk->win,
-		 dk->boot_base);
+	dev_info(dev, "taking over window %u, GF0 at 0x%08x, %ux%u\n", dk->win,
+		 dk->boot_base, dk->width, dk->height);
 	return 0;
 }
 
@@ -965,7 +971,7 @@ static int decon_drm_init(struct decon_kms *dk, struct drm_bridge *bridge)
 
 	/* evict simpledrm from S-Boot's framebuffer */
 	ret = aperture_remove_conflicting_devices(dk->boot_base,
-						  S10E_WIDTH * S10E_HEIGHT * 4,
+						  dk->width * dk->height * 4,
 						  decon_driver.name);
 	if (ret)
 		return ret;
@@ -1050,7 +1056,7 @@ static int decon_probe(struct platform_device *pdev)
 		return ret;
 
 	dk->boot_fb = devm_memremap(dev, dk->boot_base,
-				    S10E_WIDTH * S10E_HEIGHT * 4, MEMREMAP_WC);
+				    dk->width * dk->height * 4, MEMREMAP_WC);
 	if (IS_ERR(dk->boot_fb))
 		return PTR_ERR(dk->boot_fb);
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=S10: DECON KMS, and panfrost if the G3D power domain is on
+After=systemd-udevd.service s10-touch-bind.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s10-gpu-load
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

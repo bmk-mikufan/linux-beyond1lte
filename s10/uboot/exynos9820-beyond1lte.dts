@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
  * Samsung Galaxy S10 (beyond1lte/SM-G973F, SM-G973N) device tree source,
- * for a headless Ubuntu Server (USB KVM over a powered PD hub).
+ * for an Ubuntu Server USB KVM (powered PD hub) with Phosh on the phone.
  *
  * Made from the S10e's exynos9820-beyond0lte.dts: the S10e is the same
  * board as the S10 (touch, PMIC rails, buttons, MAX77705, USB-C) with a
  * smaller panel and battery. Changed here: model, the 1440x3040 S-Boot
- * framebuffer, the battery, and the S6E3FA7 panel driver (S10e only) left
- * out, so the screen stays on simple-framebuffer. Audio is off (server).
- * Not yet booted on an S10: see s10/README.ko.md.
+ * framebuffer, the battery, and the S6E3HA9 panel instead of the S10e's
+ * S6E3FA7. Audio is off (server).
+ * Not yet booted on an S10: see README.md.
  */
 
 /dts-v1/;
@@ -378,13 +378,20 @@
 	status = "okay";
 };
 
-/*
- * The S10's panel is not the S10e's S6E3FA7 and has no driver here: keep
- * DECON off and the console on S-Boot's framebuffer (simple-framebuffer).
- */
 &decon {
 	memory-region = <&fb_region>;
-	status = "disabled";
+	status = "okay";
+
+	/*
+	 * S6E3HA9 on DSIM0, lit by S-Boot (panel-samsung-s6e3ha9-beyond1).
+	 * As on the S10e, no reset-gpios or supplies on purpose: DCS only.
+	 * DECON KMS takes the panel size from S-Boot's registers; its second
+	 * CRTC drives USB-C DisplayPort.
+	 */
+	panel@0 {
+		compatible = "samsung,s6e3ha9-beyond1";
+		reg = <0>;
+	};
 };
 
 &pinctrl_peric1 {

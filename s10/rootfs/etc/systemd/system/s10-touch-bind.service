@@ -1,0 +1,12 @@
+[Unit]
+Description=S10: bind the touchscreen if its boot probe missed
+DefaultDependencies=no
+After=systemd-udevd.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s10-touch-bind
+
+[Install]
+WantedBy=sysinit.target

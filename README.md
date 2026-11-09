@@ -1,173 +1,145 @@
-Linux 7.2.13 for the Samsung Galaxy S10e (beyond0lte, SM-G970F)
-================================================================
+# 갤럭시 S10 (SM-G973N/F) 메인라인 리눅스 — Ubuntu 24.04 USB KVM
 
-Mainline Linux for the Samsung Galaxy S10e (SM-G970F, codename beyond0lte, Exynos 9820). It runs the
-phone on **Mobian** (Debian trixie with Mobian's repository) with Phosh, next to LineageOS.
+갤럭시 S10(엑시노스 9820, `beyond1lte`)에서 **메인라인 리눅스 7.2.13**과 **Ubuntu 24.04**를 돌리는 포트입니다.
+목표는 폰을 **유전원 PD 허브**에 꽂아 두고, 허브에 단 **USB 시리얼→HID 젠더**와 **캡처카드**로 KVM을 하면서
+**PD 패스스루로 충전**하는 것. 화면에는 Ubuntu Desktop(터치 + 화상 키보드)이 떠서 폰에서 바로 관리할 수 있습니다.
 
-The tree is stable **v7.2.13**, plus the Exynos 9820 work of
-[chiffathefox/exynos-9820-mainline-linux](https://github.com/chiffathefox/exynos-9820-mainline-linux)
-(7.2-rc2 based, rebased here onto 7.2.13), plus the S10e changes listed below. The device tree is not in
-this tree: it is built into U-Boot and handed to Linux from there (see `mobian/uboot/`).
+[pulpoff/linux-beyond0lte](https://github.com/pulpoff/linux-beyond0lte)(S10e)를 S10용으로 옮긴 것이고,
+S10 패널 명령은 [butztill/s10-linux](https://github.com/butztill/s10-linux)에서 가져왔습니다.
+원래 S10e 설명은 [README.s10e.md](README.s10e.md)에 있습니다.
 
-What works
-==========
+> ⚠️ **S10 실기기에서 아직 부팅해 보지 않았습니다.** S10e에서 검증된 커널과 S10용 DTS·패널 드라이버를
+> 정적으로 대조해 만들었고, 아래 "펌웨어 대조" 항목은 SKT 순정 펌웨어로 확인했습니다.
+> 처음 플래시하기 전에 복구 방법(아래)을 먼저 준비하세요.
 
-| Part | State |
-| --- | --- |
-| Display | 1080x2280 AMOLED (S6E3FA7) on DECON, taken over from the bootloader; brightness through `s10e_panel_bl`; calibrated "Natural" colour (the panel's mDNIe, set by the panel driver); panel self-refresh, so an idle screen sends no frames; an Always On Display whose analog clock the panel draws and ticks by itself in its low power mode, so the phone sleeps through it |
-| GPU | Mali-G76 MP12 with panfrost, OpenGL ES 3.1, DVFS 156–702 MHz (simple_ondemand) |
-| Touchscreen | S6SY761, double tap to wake |
-| Wi-Fi | BCM4375 B1 on PCIe, 2.4 and 5 GHz (new Exynos 9820 PCIe driver, brcmfmac support for the 4375); stays associated while the phone sleeps and wakes it for unicast traffic |
-| Bluetooth | BCM4375 B1 on UART, Bluetooth LE included |
-| Sound | speaker and microphones through the CS47L93 codec and CS35L41 amps; media playback drives ABOX without its DSP firmware, calls use it; a call's downlink and uplink as PCMs of their own, at the rates the modem's voice path uses, for a GSM gateway |
-| Modem | Shannon CP boots from the phone's own `radio` partition; voice calls with audio, SMS, LTE data (`rmnet0`, ~47/34 Mbit/s), APN from the SIM |
-| Sensors | accelerometer (screen rotation), ambient light, proximity and compass through the BCM4775 sensor hub, through suspend and resume |
-| Cameras | rear wide S5K2L4 with AK7375 autofocus, rear ultra-wide S5K3P9, front S5K3J1, through a new CSIS/write-DMA driver and libcamera's software ISP (tuning in `mobian/camera/`) |
-| Video | MFC hardware decode: H.264, HEVC, VP9 |
-| DisplayPort | USB-C DP alt mode to HDMI docks: 1080p60/120 with audio, a second CRTC on DECON2, HDMI CEC through docks that tunnel it |
-| USB | device mode (networking), host mode with hubs, USB 3 SuperSpeed through docks, Type-C orientation from the MAX77705 |
-| Battery | MAX77705 charger and fuel gauge; Qi wireless charging at 5 V through the charger's WCIN input; on a 0.5 A USB port it shows as charging, as Android does; without USB PD the input limit follows the Type-C current and BC1.2 detection (up to 1.8 A), as stock does |
-| Suspend | the phone sleeps (s2idle) a few seconds after the screen goes off, whenever nothing needs it awake (`s10e-sleepd`); calls, SMS, Wi-Fi, the power key, a double tap and the charger wake it. Kernel timers stop while it sleeps (a WFI idle state for suspend to idle) |
-| Watchdog | the SoC watchdog, fed by systemd: a stalled SoC resets by itself, and the kernel log of a panic survives in pstore |
-| RAM | 5464 MiB usable, after handing four of the vendor's camera and secure carve-outs (449 MiB) back to the kernel |
-| RTC | S2MPS19 real-time clock |
-| Buttons | power, volume, haptics |
+## 다운로드
 
-Not done: GPS, the fingerprint sensor (S-Boot locks its SPI bus to the secure world, so Linux cannot reach it
-at all), NFC, VoLTE, IPv6 on mobile data, the front camera's tuning, the SoC's own sleep state (s2idle keeps
-the SoC's rails up, so the phone still draws close to 1 W asleep, far from Android's standby), CPU idle states
-beyond WFI (C2 hangs the SoC), the display link's power-down in the AOD (Samsung's DOZE_SUSPEND), MFC encode,
-the flash LED, fast (10 V) wireless charging and Wireless PowerShare. The charger's BC1.2
-limits are checked on a PC port only.
+[릴리스](https://github.com/bmk-mikufan/linux-beyond1lte/releases)에서 받습니다.
 
-Installing it
-=============
+| 파일 | Odin 슬롯 | 내용 |
+|---|---|---|
+| `s10-uboot-boot.tar.md5` | AP (1회차) | U-Boot → boot 파티션 |
+| `s10-ubuntu-desktop-userdata.tar.md5.xz` | 압축 풀고 AP (2회차) | **Ubuntu Desktop** (GNOME, 화상 키보드) — 기본 |
+| `s10-ubuntu-lomiri-userdata.tar.md5.xz` | 〃 | Ubuntu Touch 셸(Lomiri) — 실험적 옵션 |
+| `s10-ubuntu-server-userdata.tar.md5.xz` | 〃 | 화면 UI 없는 서버 |
+| `s10-kernel-<버전>.tar.gz` | – | 커널 Image + 모듈 (업데이트용) |
 
-`mobian/zip/` builds the LineageOS recovery zip (`adb sideload`): it moves the end of `userdata` into a 40 GiB
-`linux` partition, writes the root filesystem and U-Boot, formats Android's data on a first install, and
-reboots into Linux. `s10e-firstboot` then copies the phone's own firmware from `/vendor` (see Firmware).
+userdata 이미지는 셋 중 **하나만** 고르면 됩니다. 모두 ssh, NetworkManager, ustreamer, pyserial이 들어 있습니다.
 
-Booting it
-==========
+## 무엇이 되나 (예상)
 
-The phone keeps LineageOS. **U-Boot goes into the recovery partition**, repacked into LineageOS's
-recovery image header (`mobian/uboot/repack.py`). It loads `/boot/s10e/Image`, `initramfs.cpio.gz` and
-`bootargs.env` from the partition labelled `linux` (the Debian root filesystem; on the test phone it was
-carved out of `userdata`) and passes its own device tree. `adb reboot recovery` or a plain `reboot` from
-Linux gets there. Volume Down in U-Boot opens the menu: Mobian, Mobian with the previous kernel
-(`Image.prev`), a USB rescue shell, LineageOS, download mode, console, power off.
+| 항목 | 상태 | 비고 |
+|---|---|---|
+| 부팅 (S-Boot → U-Boot → 리눅스) | 미검증 | 같은 방식이 S10+에서 동작 |
+| 화면 | DECON KMS + S6E3HA9 패널 드라이버 | 밝기, 화면 끄기/켜기(번인 방지) |
+| 터치 | S6SY761 | S10e와 같은 칩·버스 |
+| GPU | panfrost (Mali-G76) | G3D 전원 도메인이 켜져 있을 때만 로드, 아니면 소프트웨어 렌더링 |
+| USB 호스트 + 허브 | ✅ 코드상 | 9820 dwc3 허브 버그(GFLADJ) 수정 포함 |
+| **USB 3** | 켜짐 | S10e에서 독으로 검증된 경로 |
+| **DP alt mode** (USB-C → HDMI) | 켜짐, 2레인 | 1080p60, USB 3와 동시 사용 |
+| PD 충전 | 최대 9V / 15W | PPS·PR_Swap 차단 |
+| Wi-Fi | BCM4375 | 펌웨어는 첫 부팅 때 폰의 vendor 파티션에서 복사 |
+| 시스템 절전 | 꺼 둠 | KVM은 항상 깨어 있어야 함 |
+| LTE·통화·오디오·카메라 | 범위 밖 | |
 
-Build with:
+## USB 허브 + PD 패스스루 조건
 
-```
-make ARCH=arm64 LLVM=1 LOCALVERSION= olddefconfig      # starting from mobian/kernel.config as .config
-make ARCH=arm64 LLVM=1 LOCALVERSION= Image modules
+1. 허브가 **USB PD 소스**여야 합니다(허브에 PD 충전기 연결). PD 없이 전류만 주는 허브에서는 충전만 되고 기기가 안 보입니다.
+2. 이 포트는 PD 계약 1.5초 뒤 **폰이 먼저 DR_Swap(호스트 요청)** 을 보냅니다(`max77705.pd_host`, 기본 켜짐).
+   허브가 거절하면 3초 간격으로 5번 재시도합니다. 끄기: 커널 인자 `max77705.pd_host=0`.
+3. HDMI가 달린 허브는 DP를 **2레인(pin D)** 으로 잡아서 USB 3 레인을 남깁니다.
+   4K60이 필요하면 `max77705.dp_four_lanes=1`(그 대신 USB 2로 떨어짐).
+4. 시리얼→HID 젠더(CH9329 등 CH340/CP2102 기반), FTDI, PL2303, CDC-ACM 드라이버는 커널에 내장.
+   UVC 캡처카드, USB 오디오, USB 이더넷(RTL8152/AX88179)은 모듈.
+
+기기에서 확인:
+```sh
+dmesg | grep -iE 'max77705|dwc3|hub'   # "contract: 9000 mV", "PD source: asking for the host role"
+cat /sys/class/typec/port0/{power_role,data_role,power_operation_mode}   # [sink] [host] usb_power_delivery
+lsusb -t; ls /dev/ttyUSB* /dev/ttyACM* /dev/video*
 ```
 
-The kernel release is `7.2.13-s10e`. Pass `LOCALVERSION=` to every make, or it gains a `+`.
+## 순정 펌웨어 대조 (SM-G973N SKC G973NKSU7HXJ2)
 
-Changes for the Galaxy S10e
-===========================
+SamMobile 기준 MD5(`423dcc6bc787704e814d7ff9d4a3235e`)와 일치하는 SKT 순정 펌웨어를 열어서 코드의 가정과 비교했습니다.
 
-On top of chiffathefox's Exynos 9820 tree (clocks, pinctrl, UFS, ACPM, the PMIC, simple display):
+| 가정 | 순정 펌웨어에서 확인한 값 | 결과 |
+|---|---|---|
+| boot.img 헤더 (v1, page 2048, kernel 0x10008000, tags 0x10000100, board `SRPRI28D007KU`, 12.0.0/2023-04) | 같음 (10개 필드 전부 일치) | ✅ |
+| `SEANDROIDENFORCE`가 커널 바로 뒤 | 같음 (순정은 그 뒤에 삼성 서명, 언락 상태에서는 불필요) | ✅ |
+| U-Boot가 bootloader 문자열 앞 4글자 `G973`으로 S10 인식 | 펌웨어 `G973NKSU7HXJ2`, PIT `BEYOND1LTE_KOR_SINGLE` | ✅ |
+| 파티션 이름 `userdata`, `vendor`, `boot` (ext4 vendor) | GPT 소문자(TWRP fstab), Odin PIT는 대문자 | ✅ (둘 다 시도) |
+| Wi-Fi/BT 펌웨어 파일 (`bcmdhd_sta.bin_b1`, `bcmdhd_clm.blob`, `nvram.txt_CS01_semco_b1`, `bcm4375B1_semco.hcd`) | vendor 파티션에 모두 있음 | ✅ |
+| 패널 S6E3HA9 "beyond1 A3 S0" | 순정 커널에 `s6e3ha9`, `beyond1_a3_s0` 다수 | ✅ |
+| 패널 WQHD+ 명령 (scaler `ba 01 26 08 08 f3`, CASET 0x59f, PASET 0xbdf, AOR 표) | 순정 커널 표와 같음 | ✅ |
+| 메모리 예약 영역 | S-Boot DT의 고정 영역(디버그 로그 15곳, sec_rdx 등)을 모두 덮음 | ✅ |
 
-* **Display:** `drivers/gpu/drm/tiny/exynos9820-decon-kms.c` keeps the bootloader's DECON/DSIM setup and
-  turns it into a real KMS device; `panel-samsung-s6e3fa7-beyond0.c`, which also loads the panel's mDNIe
-  colour tables (Samsung's "Natural" mode: the bootloader leaves a violet-tinted one); simpledrm reports a DSI connector
-  so Phosh treats the panel as built-in. Panel self-refresh (`exynos9820-decon-kms.psr`, on by default): the TE
-  trigger starts a frame only when the picture has changed, so a still screen or the AOD clock costs no frames
-  between updates.
-* **Always On Display:** the panel driver's `lpm` (sysfs: 0, or 2, 10, 30 or 60 nit) puts the S6E3FA7 in Samsung's
-  HLPM, where it refreshes from its own memory at a low rate and voltage; `self_clock` (`analog X Y UTCOFF [12|24]`,
-  `off`, `reload`) starts the panel's own analog clock there: it draws hour and minute hands over its frame memory and
-  moves them on its own timer, so the AP sleeps for hours with the time right. The hands are a firmware image
-  (`samsung/s6e3fa7-beyond0-aod-hands.bin`) made from Samsung's GPL source (`mobian/display/aod/`); a PM notifier
-  sets the time again after a resume. The panel's self move is a module parameter (`self_move`, off). On the
-  panel's clock the AOD costs 29 mA (about 0.12 W) over the panel being off.
-* **Touchscreen:** `s6sy761.c` gets the controller's low power mode with its double tap gesture (`wake_gesture`
-  in sysfs). Userspace turns it on when it blanks the screen; the double tap comes from a second input device as
-  `KEY_WAKEUP`.
-* **GPU:** panfrost on the G76 (the G3D power domain stays on: re-powering it needs a secure-world
-  restore that mainline does not do).
-* **Wi-Fi:** `drivers/pci/controller/dwc/pcie-exynos9820.c` (root complex and PHY), and brcmfmac support
-  for the BCM4375 B1, including the shared `host_cap` the v7 PCIe protocol needs before the firmware
-  consumes receive buffers. The 4375's firmware takes mailbox data (D3 inform, D0 inform) as control ring
-  messages, as Broadcom's dhd sends it, not through the TCM mailbox, so suspend gets its D3 acknowledgement.
-  Its deep sleep requests are left unanswered: brcmfmac has no device-wake handshake to wake it again.
-  The 4375's firmware has no wowl, so the dongle wakes the host over its out-of-band line instead
-  (`brcmfmac host_wake=gpa0:7`, as Broadcom's `BCMPCIE_OOB_HOST_WAKE`): the link stays up through a suspend,
-  wowlan "any" is on by default, and while the phone sleeps the dongle passes only unicast frames (the firmware
-  answers ARP and ND) and sends the access point a keepalive every 30 s.
-* **Bluetooth:** CMU_PERIC1 clocks for UART_BT, the USI wrapper, hci_bcm power sequencing.
-* **Sound:** `sound/soc/samsung/exynos9820-abox.c` drives ABOX's DMA and routing directly for media,
-  and loads its DSP firmware (calliope) for the voice path of calls; `s10e_madera.c` machine driver; CS35L41 changes for the S10e amps.
-  For a GSM gateway, two more PCMs work during a call: "Call Downlink" (`hw:0,2`, capture: the far end's voice
-  as the CP sends it, before anything is mixed in) and "Call Uplink" (`hw:0,3`, playback: with the "Call Uplink
-  Switch" control on it goes to the CP in place of the microphones). The downlink is 16 kHz, as the CP's voice
-  frames are, and the uplink takes 4 channels, as ABOX's mixer reads them.
-* **Modem:** `drivers/misc/exynos9820-cp.c`, the boot and shared-memory link to the Shannon CP. The radio
-  stack runs in userspace (`exynos-cpd`, `mobian/modem/`): ModemManager talks AT over a WWAN AT bridge,
-  and `exynos-cpd` translates that to Samsung IPC. The CP's mailbox interrupt is a wakeup source: every
-  message from the CP keeps the phone awake for `wake_ms` (1 s), the CP's own wakelock bit holds it awake as
-  long as it is set, and `exynos-cpd` holds a kernel wakelock while a call rings or is up and for 10 s after an
-  SMS, as rild and Android's in-call screen do. Around every suspend the driver tells the CP that the AP sleeps
-  (stock's `pda_active`), so it holds back what can wait.
-* **Suspend:** suspend to idle works. Pin-controller 7 (VTS) is left out of pinctrl-exynos: it sits in a power
-  domain that is off, and saving its banks in the late suspend phase stalled the SoC. genpd no longer powers on
-  the domain of a runtime-suspended device in resume: on the 9820 the power-off after it failed and left MFC and
-  the ISP domains half on, and the next touch of them stalled the bus. With no idle states in the DT,
-  cpuidle-psci registers a WFI state with `enter_s2idle`, so suspend to idle freezes the tick and kernel timers
-  (and systemd's watchdogs) stop while the phone sleeps. The USB PHY's own supplies (S2MPS19 LDO10M-12M) go
-  down with it, which saves some 150 mW in every sleep. The policy is userspace's: `mobian/sleepd/`.
-* **Watchdog:** `s3c2410_wdt` knows the 9820's CLUSTER0 watchdog; U-Boot's DT has the node, and systemd feeds it.
-* **RAM:** `reserved_mem_skip=<node>[,...]` hands those `/reserved-memory` carve-outs to the kernel without
-  changing the boot loader's DT. The phone's `bootargs.env` frees `sec_rdx_bootdev`, `secure_camera`,
-  `camera_contig` and `camera`; freeing the debug-log regions as well moved CMA and swiotlb and crashed two boots in
-  five.
-* **Sensor hub:** `drivers/iio/common/bcm4775_shub/`. The BCM4775 boots from ROM and needs a RAM patch on
-  every power-up; the driver loads it (`brcm/bcm4775-shub.patch`, from the phone's Android), speaks
-  Broadcom's transport layer and Samsung's SSP protocol on top, and exposes the accelerometer, light and
-  proximity sensors as IIO devices for iio-sensor-proxy. Each sensor runs only while it is read. The
-  compass is a tilt-compensated heading worked out from the hub's calibrated magnetometer and the
-  accelerometer, as the triggered buffer iio-sensor-proxy expects; it appears once the hub has booted.
-  `mobian/sensorhub/` has the protocol notes and the userspace scripts it was worked out with. Through a
-  suspend it follows stock's handshake (an AP_SLEEP pulse, then AP_STATUS_RESUME), and when its SPI
-  controller comes back from a resume clocking nothing, the driver lets the controller autosuspend and boots
-  the hub again, holding the phone awake meanwhile.
-* **USB:** `drivers/usb/typec/max77705.c` (Type-C port and orientation); the USB 3 DRD PHY for the
-  Exynos 9820 with orientation-aware lane setup; dwc3 quirks stock sets in GUSB3PIPECTL (elastic buffer
-  mode, U-state exit in P1-P3, failed U1/U2 exit to Recovery).
-* **Video:** MFC v12 decode in s5p-mfc.
-* **Cameras:** `drivers/media/platform/samsung/exynos9820-csis/` (MIPI CSI-2 receivers, the PHYs and the write
-  DMA, as a V4L2 capture device), `drivers/media/i2c/s5k3p9.c` (data-driven: S5K2L4, S5K3P9 and S5K3J1, with
-  register tables), AK7375 changes for the wide camera's lens (powered only while the camera streams), the S2MPB02/S2MPB03 camera PMICs, and CMU_ISPPRE.
-  libcamera's simple pipeline and software ISP do the rest (`mobian/camera/libcamera-0.7.2-s10e.patch`).
-* **DisplayPort:** `drivers/gpu/drm/tiny/exynos9820-dp.c` (link controller, AUX, EDID, training, CEC over AUX)
-  as a bridge on a second CRTC (DECON2) in `exynos9820-decon-kms.c`; DP alt mode and HPD in `max77705.c`.
-* **USB hubs:** dwc3 on the 9820 resets GFLADJ with REFCLK_LPM_SEL set while no 24 MHz reference is there, so the
-  xHCI frame counter ran almost 3x too fast and every hub failed to enumerate; the bit is cleared now.
-* **Power:** MAX77705 charger and MAX17042-family fuel gauge changes, including the WCIN input the IDT
-  wireless receiver feeds (selected, limited to 820 mA after a ramp from 480 mA as stock does, reported
-  as online). Without a PD contract the input limit is the Type-C current the source advertises or what the
-  chip's BC1.2 detection found (a charging port 1.5 A, a dedicated charger 1.8 A), as stock's cable table has it.
-  A supplied battery that is not full reports Charging even while a 0.5 A port cannot keep up
-  with the screen (`max17042_battery.supplied_is_charging`), as Android shows "charging slowly". S2MPS19 RTC
-  and 32 kHz clock over ACPM; Exynos 9820 PMU and power domains.
+Wi-Fi가 안 되면 NVRAM이 다른 모듈용일 수 있습니다:
+`sudo ln -sf nvram.txt_1rh_es43_b1 /usr/lib/firmware/brcm/brcmfmac4375b1-pcie.txt` 후 재부팅.
 
-Firmware
-========
+## 부트로더 언락 (필수)
 
-None is in this tree. On the phone, `s10e-firstboot` copies it from the phone's own Android
-(`/vendor/firmware`) on the first boot: the BCM4375 Wi-Fi firmware, CLM blob and NVRAM, the Bluetooth `.hcd`,
-`s5p-mfc-v13.fw`, and the ABOX `calliope_*` and audio files. The sensor hub patch
-(`bbd_patch_file_beyond.h` in Samsung's kernel source, converted to text) is not on `/vendor`, so the release
-zip carries it. The modem image is read from the `radio` partition at boot. The AOD's hand image is made from
-Samsung's GPL kernel source by `mobian/display/aod/` (hour and minute hands only: `hands-clean-second.py ... none`)
-into `/lib/firmware/samsung/s6e3fa7-beyond0-aod-hands.bin`; without it the AOD shows the time as text.
+1. 설정 → 휴대전화 정보 → 소프트웨어 정보 → 빌드번호 7번 탭 → 개발자 옵션 → **OEM 잠금 해제** 켜기.
+   (메뉴가 없으면 인터넷 연결, 날짜 자동 상태로 며칠 쓴 뒤 다시 확인. KG/RMM 상태 때문에 숨겨질 수 있음)
+2. 전원 끄기 → **볼륨업 + 볼륨다운을 누른 채 USB 연결** → 경고 화면에서 **볼륨업 길게** = 언락(전체 초기화).
+3. 다시 켜서 OEM 잠금 해제 확인, download mode에서 `OEM LOCK: OFF (U)`, `KG STATE: Checking`(Prenormal 아님) 확인.
 
-mobian/
-=======
+- **Knox 워런티 비트가 영구히 깨집니다**(삼성페이·보안폴더 영구 불가). 되돌릴 수 없습니다.
 
-The userspace half: U-Boot's boot menu and the S10e device tree, the initramfs init, the kernel config,
-the services and configuration the hardware needs on Mobian, the sleep daemon, the recovery zip, the camera
-stack, and the Neo launcher and apps the image ships. See `mobian/README.md`.
+## 플래시 (Windows, Odin 3.14 이상)
+
+1. 릴리스에서 `s10-uboot-boot.tar.md5`와, 고른 userdata 파일(`.xz`)을 받고 7-Zip 등으로 `.xz`를 풉니다.
+2. download mode 진입, Odin에서 **BL/CP/CSC는 비우고 Re-Partition은 끕니다**.
+3. **AP = `s10-uboot-boot.tar.md5`** → Start.
+4. 다시 download mode → **AP = `s10-ubuntu-<변형>-userdata.tar.md5`** → Start (**Android 데이터 전부 삭제**).
+5. 재부팅. 첫 부팅은 파일시스템 확장 + Wi-Fi 펌웨어 복사 후 **한 번 자동 재부팅**합니다.
+
+Linux에서는 `heimdall flash --BOOT boot.img`, `heimdall flash --USERDATA userdata.img`.
+efs(IMEI)·vendor·modem 파티션은 건드리지 않습니다.
+
+### 원복
+삼성 정식 펌웨어(SM-G973N, 본인 CSC: SKC/KTC/LUC/KOO)를 BL/AP/CP/CSC에 모두 넣고 Odin으로 플래시합니다.
+download mode는 언제든 **볼륨업 + 볼륨다운 + USB 연결**로 들어갈 수 있고, U-Boot 메뉴(볼륨다운)에도 있습니다.
+
+## 첫 로그인
+
+- 사용자 `ubuntu` / 암호 `ubuntu` → **로그인하면 바로 암호를 바꾸라고 나옵니다**.
+- Desktop: GDM 로그인 화면에서 터치로 입력(화상 키보드 켜짐), 화면 배율 300%. Wi-Fi는 설정 앱에서.
+- Server: 허브에 USB 키보드를 꽂아 콘솔에서 로그인 → `sudo nmcli dev wifi connect <SSID> password <암호>`.
+- 유선: 허브에 USB 이더넷을 꽂으면 DHCP로 바로 ssh.
+- KVM: 캡처 `ustreamer --device=/dev/video0 --host=0.0.0.0 --port=8080`, HID 젠더는 `/dev/ttyUSB0`.
+
+U-Boot 메뉴(부팅 중 볼륨다운): Ubuntu / 이전 커널 / 자세한 로그 / download mode / 콘솔 / 전원 끄기.
+커널 인자는 `/boot/s10/bootargs.env`(`s10_args=...` 한 줄)로 다시 플래시하지 않고 바꿀 수 있습니다.
+
+## 바뀐 것 (pulpoff S10e 트리 대비)
+
+- `drivers/usb/typec/max77705.c`: `pd_host` — PD 싱크인데 device 역할이면 폰이 호스트 역할을 요청.
+- `drivers/gpu/drm/panel/panel-samsung-s6e3ha9-beyond1.c`: S10 패널(인수인계형, DCS만, AOR 밝기).
+- `drivers/gpu/drm/tiny/exynos9820-decon-kms.c`: 해상도를 하드코딩(1080x2280) 대신 S-Boot 레지스터에서 읽음.
+- `s10/uboot/exynos9820-beyond1lte.dts`: S10e DTS 기반, 모델·1440x3040·배터리 3300mAh·패널·오디오 off.
+- `s10/uboot/exynos-mobile.env`: U-Boot는 boot 파티션, Ubuntu는 userdata 전체(ext4), `root=PARTUUID`.
+- `s10/build-kernel.sh`, `s10/build-uboot.sh`, `s10/mkbootimg-v1.py`, `s10/build-rootfs.sh`,
+  `.github/workflows/s10-images.yml`: 빌드와 Odin 패키징.
+
+## 빌드
+
+```sh
+# 커널: WSL/리눅스, clang + lld
+sh s10/build-kernel.sh                         # out-s10/s10-kernel-<rel>.tar.gz
+gh release create <태그> out-s10/s10-kernel-*.tar.gz
+# U-Boot + rootfs(sudo 필요) → GitHub Actions arm64 러너
+gh workflow run s10-images.yml -f tag=<태그> -f variants='["desktop","lomiri","server"]'
+```
+로컬: `CROSS_COMPILE=aarch64-linux-gnu- sh s10/build-uboot.sh`, `sudo DE=desktop sh s10/build-rootfs.sh out-s10/s10-kernel-*.tar.gz`.
+
+## 아직 모르는 것
+
+- S10 S-Boot가 boot 파티션의 U-Boot를 그대로 실행하는지(S10+에서는 동작).
+- 새 S6E3HA9 패널 드라이버와 DECON KMS의 S10 첫 인수인계(명령 바이트는 순정과 일치).
+- 쓰시는 허브가 DR_Swap을 받아들이는지.
+- Lomiri(Mir)가 이 GPU/디스플레이 조합에서 뜨는지 — 실험적.
+
+## 라이선스
+
+커널은 GPL-2.0(각 파일의 고지가 우선). 펌웨어는 포함하지 않으며 폰의 vendor 파티션에서 복사합니다.

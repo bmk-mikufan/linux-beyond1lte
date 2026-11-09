@@ -915,6 +915,15 @@ config DRM_PANEL_SAMSUNG_S6E3FA7_BEYOND0
 	  Say Y here for the 1080x2280 command-mode AMOLED of the Galaxy S10e
 	  (beyond0lte). The panel is taken over lit from the bootloader.
 
+config DRM_PANEL_SAMSUNG_S6E3HA9_BEYOND1
+	tristate "Samsung S6E3HA9 panel of the Galaxy S10"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  Say Y here for the 1440x3040 command-mode AMOLED of the Galaxy S10
+	  (beyond1lte). The panel is taken over lit from the bootloader.
+
 config DRM_PANEL_SAMSUNG_S6D16D0
 	tristate "Samsung S6D16D0 DSI video mode panel"
 	depends on OF

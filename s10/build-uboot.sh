@@ -43,9 +43,11 @@ cp .output/dts/upstream/src/arm64/exynos/exynos9820-beyond1lte.dtb "$OUT/" 2>/de
 
 cd "$OUT"
 rm -f boot.img
+# header values as in the SM-G973N SKC G973NKSU7HXJ2 stock boot.img (board SRPRI28D007KU,
+# 12.0.0 / 2023-04, kernel at 0x10008000, tags at 0x10000100, 2048-byte pages)
 python3 "$TOP/s10/mkbootimg-v1.py" u-boot-s10.bin boot.img \
-	--base 0x10000000 --pagesize 2048 --board SRPRI28B009RU \
-	--os-version 12.0.0 --os-patch-level 2023-01
+	--base 0x10000000 --pagesize 2048 --board "${BOARD:-SRPRI28D007KU}" \
+	--os-version 12.0.0 --os-patch-level 2023-04
 printf 'SEANDROIDENFORCE' >> boot.img
 
 T=s10-uboot-boot.tar

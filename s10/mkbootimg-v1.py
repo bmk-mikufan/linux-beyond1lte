@@ -35,10 +35,11 @@ for part in (kernel, b'', b'', b''):	# kernel, ramdisk, second, recovery_dtbo
 
 hdr = bytearray(a.pagesize)
 hdr[0:8] = b'ANDROID!'
+# no ramdisk or second stage: their addresses stay 0, as in Samsung's own boot.img
 struct.pack_into('<10I', hdr, 8,
 	len(kernel), a.base + a.kernel_offset,
-	0, a.base + a.ramdisk_offset,
-	0, a.base + a.second_offset,
+	0, 0,
+	0, 0,
 	a.base + a.tags_offset, a.pagesize,
 	1, os_version)
 board = a.board.encode()

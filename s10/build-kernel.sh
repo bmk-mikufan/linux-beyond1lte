@@ -21,6 +21,8 @@ $C --enable USB_SERIAL_CH341 --enable USB_SERIAL_CP210X --enable USB_SERIAL_FTDI
    --module USB_VIDEO_CLASS --enable SND_USB_AUDIO \
    --module USB_RTL8152 --module USB_NET_AX88179_178A --module USB_NET_CDC_ETHER \
    --module USB_NET_CDC_NCM --module USB_USBNET --enable USB_UAS
+# the S10's own panel, so DECON KMS (and its DisplayPort CRTC) comes up
+$C --module DRM_PANEL_SAMSUNG_S6E3HA9_BEYOND1
 $M olddefconfig
 $M Image modules
 

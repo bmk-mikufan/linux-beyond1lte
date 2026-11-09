@@ -1,6 +1,7 @@
-# Galaxy S10 (beyond1lte) Odin images: U-Boot (boot) and Ubuntu Server (userdata).
+# Galaxy S10 (beyond1lte) Odin images: U-Boot (boot) and Ubuntu 24.04 (userdata).
 # The kernel is built locally (s10/build-kernel.sh) and attached to a release first;
-# this workflow takes s10-kernel-*.tar.gz from that release and adds the Odin files to it.
+# this workflow takes s10-kernel-*.tar.gz from that release and adds the Odin files to it,
+# one userdata image per desktop variant.
 name: s10-images
 
 on:
@@ -9,6 +10,9 @@ on:
       tag:
         description: "Release tag that carries s10-kernel-*.tar.gz"
         required: true
+      variants:
+        description: 'JSON list of rootfs variants: desktop, lomiri, server'
+        default: '["desktop","lomiri","server"]'
 
 permissions:
   contents: write
@@ -16,10 +20,15 @@ permissions:
 jobs:
   images:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        de: ${{ fromJSON(inputs.variants) }}
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag }}
+      DE: ${{ matrix.de }}
       OUT: ${{ github.workspace }}/out-s10
     steps:
       - uses: actions/checkout@v4
@@ -44,16 +53,21 @@ jobs:
           ls -l "$OUT"
 
       - name: U-Boot -> boot.img
+        if: matrix.de == 'desktop'
         run: sh s10/build-uboot.sh
 
-      - name: Ubuntu Server -> userdata.img
+      - name: Ubuntu (${{ matrix.de }}) -> userdata.img
         run: sudo -E sh s10/build-rootfs.sh "$(ls "$OUT"/s10-kernel-*.tar.gz)"
 
       - name: Upload to the release
         run: |
           cd "$OUT"
-          sudo chown "$(id -u):$(id -g)" s10-ubuntu-userdata.tar.md5
-          xz -T0 -6 s10-ubuntu-userdata.tar.md5
-          sha256sum s10-uboot-boot.tar.md5 s10-ubuntu-userdata.tar.md5.xz u-boot-s10.bin exynos9820-beyond1lte.dtb > SHA256SUMS-images
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
-            s10-uboot-boot.tar.md5 s10-ubuntu-userdata.tar.md5.xz u-boot-s10.bin exynos9820-beyond1lte.dtb SHA256SUMS-images
+          U=s10-ubuntu-$DE-userdata.tar.md5
+          sudo chown "$(id -u):$(id -g)" $U
+          xz -T0 -6 $U
+          F="$U.xz"
+          if [ "$DE" = desktop ]; then
+            F="$F s10-uboot-boot.tar.md5 u-boot-s10.bin exynos9820-beyond1lte.dtb"
+          fi
+          sha256sum $F > SHA256SUMS-$DE
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber $F SHA256SUMS-$DE
