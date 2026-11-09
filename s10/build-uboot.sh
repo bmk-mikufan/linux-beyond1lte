@@ -8,10 +8,11 @@
 # Boot image, as S-Boot of the S10 family wants it (gangg111/S10Plus_Linux, TWRP beyond1lte):
 # header v1, 2048-byte pages, base 0x10000000, and the SEANDROIDENFORCE tail after the image.
 # Odin reads ustar archives only; the file name inside picks the partition; the .md5 is the tar
-# with its md5sum line appended.
+# with its md5sum line appended. The tar also carries vbmeta.img with verification disabled:
+# the stock vbmeta checks boot by hash, which U-Boot's boot.img fails.
 #
 #   CROSS_COMPILE=aarch64-linux-gnu- sh s10/build-uboot.sh     (empty on an arm64 host)
-# Output: $OUT/u-boot-s10.bin, boot.img, s10-uboot-boot.tar.md5
+# Output: $OUT/u-boot-s10.bin, boot.img, vbmeta.img, s10-uboot-boot.tar.md5 (boot + vbmeta)
 set -eu
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${OUT:-$TOP/out-s10}
@@ -52,7 +53,8 @@ printf 'SEANDROIDENFORCE' >> boot.img
 
 T=s10-uboot-boot.tar
 rm -f $T $T.md5
-tar --format=ustar -cf $T boot.img
+python3 "$TOP/s10/make-vbmeta-disabled.py" vbmeta.img
+tar --format=ustar -cf $T boot.img vbmeta.img
 md5sum -t $T >> $T
 mv $T $T.md5
-ls -l u-boot-s10.bin boot.img $T.md5
+ls -l u-boot-s10.bin boot.img vbmeta.img $T.md5

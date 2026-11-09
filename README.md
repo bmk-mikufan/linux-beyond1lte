@@ -18,7 +18,7 @@ S10 패널 명령은 [butztill/s10-linux](https://github.com/butztill/s10-linux)
 
 | 파일 | Odin 슬롯 | 내용 |
 |---|---|---|
-| `s10-uboot-boot.tar.md5` | AP (1회차) | U-Boot → boot 파티션 |
+| `s10-uboot-boot.tar.md5` | AP (1회차) | U-Boot → boot, 검증 해제 vbmeta → vbmeta |
 | `s10-ubuntu-desktop-userdata.tar.md5.xz` | 압축 풀고 AP (2회차) | **Ubuntu Desktop** (GNOME, 화상 키보드) — 기본 |
 | `s10-ubuntu-lomiri-userdata.tar.md5.xz` | 〃 | Ubuntu Touch 셸(Lomiri) — 실험적 옵션 |
 | `s10-ubuntu-server-userdata.tar.md5.xz` | 〃 | 화면 UI 없는 서버 |
@@ -67,6 +67,7 @@ SamMobile 기준 MD5(`423dcc6bc787704e814d7ff9d4a3235e`)와 일치하는 SKT 순
 |---|---|---|
 | boot.img 헤더 (v1, page 2048, kernel 0x10008000, tags 0x10000100, board `SRPRI28D007KU`, 12.0.0/2023-04) | 같음 (10개 필드 전부 일치) | ✅ |
 | `SEANDROIDENFORCE`가 커널 바로 뒤 | 같음 (순정은 그 뒤에 삼성 서명, 언락 상태에서는 불필요) | ✅ |
+| vbmeta | 순정은 flags 0(검증 켬)이고 **boot를 해시로 검증** → U-Boot boot.img는 불통과 | ⚠️ → 검증 해제 vbmeta(flags 2, 삼성 데이터 없음)를 boot와 같은 tar에 넣음 |
 | U-Boot가 bootloader 문자열 앞 4글자 `G973`으로 S10 인식 | 펌웨어 `G973NKSU7HXJ2`, PIT `BEYOND1LTE_KOR_SINGLE` | ✅ |
 | 파티션 이름 `userdata`, `vendor`, `boot` (ext4 vendor) | GPT 소문자(TWRP fstab), Odin PIT는 대문자 | ✅ (둘 다 시도) |
 | Wi-Fi/BT 펌웨어 파일 (`bcmdhd_sta.bin_b1`, `bcmdhd_clm.blob`, `nvram.txt_CS01_semco_b1`, `bcm4375B1_semco.hcd`) | vendor 파티션에 모두 있음 | ✅ |
@@ -90,7 +91,8 @@ Wi-Fi가 안 되면 NVRAM이 다른 모듈용일 수 있습니다:
 
 1. 릴리스에서 `s10-uboot-boot.tar.md5`와, 고른 userdata 파일(`.xz`)을 받고 7-Zip 등으로 `.xz`를 풉니다.
 2. download mode 진입, Odin에서 **BL/CP/CSC는 비우고 Re-Partition은 끕니다**.
-3. **AP = `s10-uboot-boot.tar.md5`** → Start.
+3. **AP = `s10-uboot-boot.tar.md5`** → Start. (boot.img와 vbmeta.img가 함께 들어갑니다. 순정 vbmeta가
+   boot를 해시로 검증하기 때문에, 검증을 끈 vbmeta 없이는 부팅이 막힐 수 있습니다.)
 4. 다시 download mode → **AP = `s10-ubuntu-<변형>-userdata.tar.md5`** → Start (**Android 데이터 전부 삭제**).
 5. 재부팅. 첫 부팅은 파일시스템 확장 + Wi-Fi 펌웨어 복사 후 **한 번 자동 재부팅**합니다.
 
