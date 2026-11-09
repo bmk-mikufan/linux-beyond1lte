@@ -41,7 +41,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
 	systemd-resolved systemd-timesyncd netplan.io network-manager wpasupplicant iw wireless-regdb \
 	openssh-server sudo bash-completion nano less vim-tiny iproute2 iputils-ping curl \
-	usbutils pciutils e2fsprogs debugfs htop tmux tzdata console-setup kbd \
+	usbutils pciutils e2fsprogs htop tmux tzdata console-setup kbd \
 	v4l-utils ustreamer python3 python3-serial alsa-utils
 apt-get clean
 locale-gen en_US.UTF-8 ko_KR.UTF-8
