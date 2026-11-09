@@ -43,17 +43,9 @@ cp .output/dts/upstream/src/arm64/exynos/exynos9820-beyond1lte.dtb "$OUT/" 2>/de
 
 cd "$OUT"
 rm -f boot.img
-mkbootimg -o boot.img \
-	--kernel u-boot-s10.bin \
-	--header_version 1 \
-	--base 0x10000000 \
-	--pagesize 2048 \
-	--kernel_offset 0x00008000 \
-	--ramdisk_offset 0x01000000 \
-	--tags_offset 0x00000100 \
-	--board SRPRI28B009RU \
-	--os_version 12.0.0 \
-	--os_patch_level 2023-01
+python3 "$TOP/s10/mkbootimg-v1.py" u-boot-s10.bin boot.img \
+	--base 0x10000000 --pagesize 2048 --board SRPRI28B009RU \
+	--os-version 12.0.0 --os-patch-level 2023-01
 printf 'SEANDROIDENFORCE' >> boot.img
 
 T=s10-uboot-boot.tar
