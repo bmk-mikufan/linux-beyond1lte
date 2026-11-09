@@ -9,6 +9,7 @@
 # inside): U-Boot loads /boot/s10/Image from it, the kernel mounts it by PARTUUID, and
 # systemd grows it to the partition on the first boot (x-systemd.growfs).
 set -eu
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTAR=$(realpath "$1")
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${OUT:-$TOP/out-s10}
